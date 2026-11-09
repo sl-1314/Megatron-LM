@@ -67,6 +67,8 @@ class OptimizerConfig:
     offload_fraction: float | None = None
     use_precision_aware_optimizer: bool | None = None
     decoupled_weight_decay: bool | None = None
+    fsdp2_use_fp32_shards: bool | None = None
+    fsdp2_use_fp32_master: bool | None = None
 
 
 @dataclass

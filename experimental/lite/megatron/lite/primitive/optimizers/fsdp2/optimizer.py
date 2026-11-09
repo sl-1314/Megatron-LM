@@ -388,6 +388,12 @@ def build_fsdp2_training_optimizer(
     )
     if expert_params and not expert_modules:
         raise RuntimeError("FSDP2 expert parameters were found but no expert module was found.")
+    # Validation-only set: drop it BEFORE wrapping. It pins every original
+    # expert Parameter for the whole wrap loop, so the per-module
+    # fully_shard storage swap cannot free the old storages and resident
+    # memory climbs by the full expert size per module (2x model peak,
+    # OOM on memory-constrained EP layouts).
+    del expert_params
 
     if opt is None:
         opt = SimpleNamespace(

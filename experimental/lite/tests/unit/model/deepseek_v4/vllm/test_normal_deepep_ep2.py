@@ -11,6 +11,7 @@ from megatron.lite.model.deepseek_v4.vllm.primitive.moe.communication import (
     VLLMAlignedNormalDeepEPDispatcher,
 )
 from megatron.lite.model.deepseek_v4.vllm.primitive.moe.grouped import (
+    DeploymentGroupedBlockFP8Adapter,
     VLLMGroupedMoEWithBF16Backward,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -84,6 +85,7 @@ def _run_microbatch(
         expert_input,
         actual_counts,
         0.0,
+        DeploymentGroupedBlockFP8Adapter(),
         *weights,
     )
     output = dispatcher.combine(expert_output)

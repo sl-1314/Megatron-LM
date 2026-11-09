@@ -11,16 +11,16 @@ from typing import Any
 import torch
 from vllm import envs
 from vllm.config import VllmConfig, set_current_vllm_config
-from vllm.models.deepseek_v4.common.ops import save_partial_states
+from vllm.models.deepseek_v4.common.ops.save_partial_states import (
+    _SAVE_PARTIAL_STATES_KERNEL as save_partial_states,
+)
 from vllm.models.deepseek_v4.common.rope import build_deepseek_v4_rope
 from vllm.transformers_utils.config import get_config
 
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
 from megatron.core.transformer.experimental_attention_variant.csa_utils import cp_utils
 from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
-from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import (
-    _rope_and_qnorm,
-)
+from megatron.lite.model.deepseek_v4.vllm.primitive.attention.backward import _rope_and_qnorm
 from megatron.lite.model.deepseek_v4.vllm.primitive.attention.host_geometry import (
     compressed_sequence_boundaries,
     padded_sequence_boundaries,
@@ -245,7 +245,7 @@ def compressor_operation(
     use_cutedsl = head_dim == 512 and kv_score.device.type == "cuda"
     if use_cutedsl:
         from vllm.models.deepseek_v4.nvidia.ops.sparse_attn_compress_cutedsl import (
-            compress_norm_rope_store_cutedsl as compress,
+            _SPARSE_ATTN_COMPRESSOR_CUTEDSL_KERNEL as compress,
         )
     else:
         from vllm.models.deepseek_v4.common.ops.fused_compress_quant_cache import (
@@ -460,16 +460,16 @@ def _packed_cache(
 def _dequantize_packed_cache(
     cache: torch.Tensor, rows: int, *, block_size: int = 64
 ) -> torch.Tensor:
-    from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        dequantize_and_gather_k_cache_triton,
-    )
+    from vllm.models.deepseek_v4.common.ops.cache_utils import dequantize_and_gather_k_cache
 
     output = torch.empty((1, rows, 512), dtype=torch.bfloat16, device=cache.device)
     if rows:
         blocks = (rows + block_size - 1) // block_size
-        dequantize_and_gather_k_cache_triton(
+        dequantize_and_gather_k_cache(
             output,
-            cache,
+            cache.as_strided(
+                (cache.shape[0], block_size, 584), (cache.stride(0), 584, 1)
+            ),
             torch.tensor([rows], dtype=torch.int32, device=cache.device),
             None,
             torch.arange(blocks, dtype=torch.int32, device=cache.device).unsqueeze(0),
@@ -480,9 +480,7 @@ def _dequantize_packed_cache(
 
 
 def quantized_main_k_visible(functional_k: torch.Tensor) -> torch.Tensor:
-    from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        quantize_and_insert_k_cache,
-    )
+    from vllm.models.deepseek_v4.common.ops.cache_utils import quantize_and_insert_k_cache
 
     rows = functional_k.shape[0]
     if rows == 0:
@@ -561,9 +559,7 @@ def official_compact_compressed_visible(
     functional_k = functional_k[:groups]
     compressed_group_ids = compressed_group_ids[:groups]
     # Each packed request needs an independent compressor state reset.
-    from vllm.models.deepseek_v4.common.ops.cache_utils import (
-        dequantize_and_gather_k_cache_triton,
-    )
+    from vllm.models.deepseek_v4.common.ops.cache_utils import dequantize_and_gather_k_cache
 
     block_size = runtime_metadata.k_cache.shape[1]
     visible_parts = []
@@ -617,7 +613,7 @@ def official_compact_compressed_visible(
                 device=compact_score.device,
             )
             blocks = (segment_groups + block_size - 1) // block_size
-            dequantize_and_gather_k_cache_triton(
+            dequantize_and_gather_k_cache(
                 output,
                 segment.k_cache,
                 torch.tensor(
@@ -686,12 +682,8 @@ def official_indexer_topk(
     ratio: int,
     topk: int,
 ) -> torch.Tensor:
-    from vllm.models.deepseek_v4.common.ops.fused_indexer_q import (
-        fused_indexer_q_rope_quant,
-    )
-    from vllm.model_executor.layers.quantization.utils.fp8_utils import (
-        per_token_group_quant_fp8,
-    )
+    from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
+    from vllm.models.deepseek_v4.common.ops.fused_indexer_q import fused_indexer_q_rope_quant
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
     rows = index_q.shape[0]

@@ -844,6 +844,8 @@ class MegatronLiteEngine(BaseEngine):
             offload_fraction=offload_fraction,
             use_precision_aware_optimizer=override.get("use_precision_aware_optimizer"),
             decoupled_weight_decay=override.get("decoupled_weight_decay"),
+            fsdp2_use_fp32_shards=override.get("fsdp2_use_fp32_shards"),
+            fsdp2_use_fp32_master=override.get("fsdp2_use_fp32_master"),
         )
 
     @staticmethod
