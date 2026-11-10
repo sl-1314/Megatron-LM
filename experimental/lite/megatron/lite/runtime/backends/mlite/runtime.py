@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import gc
 import os
+import sys
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import fields as dc_fields
 from datetime import timedelta
@@ -471,6 +472,18 @@ class MegatronLiteRuntime(RuntimeBase):
                 # allocator to return their now-unused blocks.
                 gc.collect()
                 torch.cuda.empty_cache()
+                if os.environ.get("VERL_MLITE_TRACE_GPU_MEM") == "1":
+                    free_b, total_b = torch.cuda.mem_get_info()
+                    print(
+                        f"VERL_MLITE_GPU_MEM_TRACE rank={torch.distributed.get_rank()}"
+                        f" model={model} optimizer={optimizer} grad={grad}"
+                        f" driver_free={free_b / 2**30:.1f}G"
+                        f" driver_total={total_b / 2**30:.1f}G"
+                        f" torch_alloc={torch.cuda.memory_allocated() / 2**30:.1f}G"
+                        f" torch_reserved={torch.cuda.memory_reserved() / 2**30:.1f}G",
+                        file=sys.stderr,
+                        flush=True,
+                    )
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
