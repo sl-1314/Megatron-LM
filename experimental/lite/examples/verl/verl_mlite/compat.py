@@ -593,6 +593,12 @@ def _patch_verl_qat_mapping_config() -> bool:
 
     dispatch_rollout_weight_quantizer._verl_mlite_qat_mapping_aware = True
     module.dispatch_rollout_weight_quantizer = dispatch_rollout_weight_quantizer
+    # ``from verl.utils.qat import dispatch_rollout_weight_quantizer`` (engine_workers)
+    # resolves through the *package* namespace, which already bound the original at
+    # import time -- rebind it too, or the wrapper is bypassed.
+    package = sys.modules.get("verl.utils.qat")
+    if package is not None and getattr(package, "dispatch_rollout_weight_quantizer", None) is original:
+        package.dispatch_rollout_weight_quantizer = dispatch_rollout_weight_quantizer
     # engine_workers binds the symbol at import time; rebind if already loaded
     # (sitecustomize normally patches before any verl import, so this is a no-op).
     consumer = sys.modules.get("verl.workers.engine_workers")
