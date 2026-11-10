@@ -1397,6 +1397,51 @@ def _patch_bucketed_weight_sender() -> bool:
     return changed
 
 
+def _patch_fsdp_reset_shard_trace() -> bool:
+    """Trace FSDP2 ``reset_sharded_param`` on params missing ``_local_tensor``.
+
+    torch 2.14's ``FSDPModule._apply`` (reached via mlite's ``model_chunk.to()``
+    offload) calls ``reset_sharded_param`` for every managed param, which reads
+    ``new_param._local_tensor`` off the module attribute.  If a mid-forward
+    exception (or an export/summon path) left a plain Parameter registered on
+    the module, this raises an opaque ``AttributeError: 'Parameter' object has
+    no attribute '_local_tensor'``.  Opt-in diagnostics: log the offending
+    module class + param name before the original raises, so the source of the
+    plain Parameter is identifiable from the run log.  Patched on the defining
+    class (instance dispatch), so no namespace rebinding is needed.
+    """
+    if os.environ.get("VERL_MLITE_TRACE_FSDP_RESET") != "1":
+        return False
+    try:
+        import torch.distributed.fsdp._fully_shard._fsdp_param as fp_module
+    except Exception:
+        return False
+    original = getattr(fp_module.FSDPParam, "reset_sharded_param", None)
+    if original is None or getattr(original, "_verl_mlite_fsdp_reset_trace", False):
+        return False
+
+    @wraps(original)
+    def reset_sharded_param(self: Any) -> None:
+        try:
+            new_param = getattr(self._module_info.module, self._module_info.param_name)
+            if not hasattr(new_param, "_local_tensor"):
+                print(
+                    f"VERL_MLITE_FSDP_RESET_TRACE plain_param module="
+                    f"{type(self._module_info.module).__name__} "
+                    f"param={self._module_info.param_name} "
+                    f"sharded_state={self.sharded_state}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        except Exception:
+            pass
+        return original(self)
+
+    reset_sharded_param._verl_mlite_fsdp_reset_trace = True
+    fp_module.FSDPParam.reset_sharded_param = reset_sharded_param
+    return True
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_transformers_vision2seq_alias()
@@ -1427,6 +1472,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
+    result = _patch_fsdp_reset_shard_trace()
+    _trace_runtime_patch("11.fsdp_reset_shard_trace", result)
     _trace_runtime_patch("10.end")
 
 
