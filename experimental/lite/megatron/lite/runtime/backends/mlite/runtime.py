@@ -455,17 +455,22 @@ class MegatronLiteRuntime(RuntimeBase):
                     offload_state()
                 else:
                     offload_optimizer(handle._optimizer)
-            if training_transfer:
-                self.release_export_scratch(handle)
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
-                    # R3/full-recompute may leave CUDA tensors reachable only
-                    # through dead Python cycles until the next periodic GC.
-                    # vLLM remaps its sleeping weights immediately after this
-                    # boundary, so collect those cycles before asking the CUDA
-                    # allocator to return their now-unused blocks.
-                    gc.collect()
-                    torch.cuda.empty_cache()
+            # The colocated rollout remaps its sleeping weights and KV cache as
+            # soon as this boundary returns, so release driver-visible memory
+            # whenever the device is handed back -- not only for full training
+            # transfers.  With param offload disabled (model=False) the torch
+            # caching allocator otherwise keeps freed activation/grad blocks
+            # mapped, and vLLM's VMM recommit then dies with a driver OOM.
+            self.release_export_scratch(handle)
+            if torch.cuda.is_available():
+                torch.cuda.synchronize()
+                # R3/full-recompute may leave CUDA tensors reachable only
+                # through dead Python cycles until the next periodic GC.
+                # vLLM remaps its sleeping weights immediately after this
+                # boundary, so collect those cycles before asking the CUDA
+                # allocator to return their now-unused blocks.
+                gc.collect()
+                torch.cuda.empty_cache()
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
