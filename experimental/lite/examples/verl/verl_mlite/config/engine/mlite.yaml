@@ -4,7 +4,8 @@ strategy: mlite
 custom_backend_module: verl_mlite.engine.mlite_engine
 param_offload: false
 optimizer_offload: false
-grad_offload: false
+# grad_offload removed: verl 5c5ab4b2 EngineConfig no longer has this field
+# (mlite preview yaml drift); keep parity with upstream verl pin.
 forward_only: false
 dtype: bfloat16
 export_dtype: bfloat16
