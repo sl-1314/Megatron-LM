@@ -11,7 +11,7 @@ import os
 import queue
 import sys
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextvars import copy_context
 from functools import wraps
@@ -565,6 +565,55 @@ def _patch_verl_dsv4_mxfp4_check() -> bool:
     _is_mxfp4_fused_moe_module._verl_mlite_factory_aware = True
     module._is_mxfp4_fused_moe_module = _is_mxfp4_fused_moe_module
     return True
+
+
+def _patch_verl_qat_mapping_config() -> bool:
+    """Accept a Mapping ``qat_config`` in verl's rollout weight-quantizer dispatch.
+
+    MegatronLiteEngineConfig keeps ``qat`` as a plain mapping (yaml ``qat: {}``),
+    while verl 5c5ab4b2b1's ``dispatch_rollout_weight_quantizer`` reads
+    ``qat_config.enable`` / ``qat_config.mode`` *attributes*, so an unquantized
+    mlite run dies with ``AttributeError: 'dict' object has no attribute 'enable'``
+    during worker init. Wrap the dispatch to coerce a mapping into an attribute
+    container first; verl source is untouched.
+    """
+    try:
+        module = importlib.import_module("verl.utils.qat.compressed_tensors")
+    except Exception:
+        return False
+    original = getattr(module, "dispatch_rollout_weight_quantizer", None)
+    if original is None or getattr(original, "_verl_mlite_qat_mapping_aware", False):
+        return False
+
+    @wraps(original)
+    def dispatch_rollout_weight_quantizer(*args: Any, qat_config: Any = None, **kwargs: Any) -> Any:
+        if isinstance(qat_config, Mapping):
+            qat_config = _QatConfigShim(qat_config)
+        return original(*args, qat_config=qat_config, **kwargs)
+
+    dispatch_rollout_weight_quantizer._verl_mlite_qat_mapping_aware = True
+    module.dispatch_rollout_weight_quantizer = dispatch_rollout_weight_quantizer
+    # engine_workers binds the symbol at import time; rebind if already loaded
+    # (sitecustomize normally patches before any verl import, so this is a no-op).
+    consumer = sys.modules.get("verl.workers.engine_workers")
+    if consumer is not None and getattr(consumer, "dispatch_rollout_weight_quantizer", None) is original:
+        consumer.dispatch_rollout_weight_quantizer = dispatch_rollout_weight_quantizer
+    return True
+
+
+class _QatConfigShim:
+    """Attribute-style view over a mlite qat mapping (enable/mode only)."""
+
+    def __init__(self, qat: Mapping) -> None:
+        self._qat = dict(qat)
+
+    @property
+    def enable(self) -> bool:
+        return bool(self._qat.get("enable", False))
+
+    @property
+    def mode(self) -> Any:
+        return self._qat.get("mode", None)
 
 
 def _restore_dsv4_attn_sink_padding(model: Any) -> int:
@@ -1366,6 +1415,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08.bucketed_weight_sender", result)
     result = _patch_verl_dsv4_mxfp4_check()
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
+    result = _patch_verl_qat_mapping_config()
+    _trace_runtime_patch("08d.verl_qat_mapping_config", result)
     result = _patch_verl_dsv4_native_layerwise_reload()
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
     result = _patch_vllm_server_profile()
