@@ -99,10 +99,10 @@ def _torch_grouped_moe(
         beg = int(ends[e - 1]) if e else 0
         if beg == end:
             continue
-        c1 = xs_s[beg:end] @ w13[e]
+        c1 = torch.nn.functional.linear(xs_s[beg:end], w13[e])
         gate, up = c1.chunk(2, dim=-1)
         c2 = torch.nn.functional.silu(gate) * up
-        c3 = c2 @ w2[e].t()
+        c3 = torch.nn.functional.linear(c2, w2[e])
         out_sorted[beg:end] = c3.float() * wts_s[beg:end, None]
     out_orig = torch.zeros_like(out_sorted)
     out_orig[order] = out_sorted

@@ -370,7 +370,11 @@ if _HAS_TRITON:
             sig = torch.sigmoid(zf)
             s = zf * sig  # silu(z)
             A = rstd * wf * s * dyf
-            t = (dyf * (xf * rstd * wf * s)).sum(-1, keepdim=True)
+            # t is sum(dy * g * x) with NO rstd inside: rstd's own gradient
+            # path is the rstd^3 factor below (an extra rstd here made the
+            # correction term rstd x too large — rstd ~ 30-50 in this model,
+            # exploding the backward; caught by C6 grad-vs-autograd probe).
+            t = (dyf * (xf * wf * s)).sum(-1, keepdim=True)
             dx = A - (rstd * rstd * rstd) * (xf / n) * t
             dz = dyf * (xf * rstd * wf) * (sig * (1.0 + zf * (1.0 - sig)))
             dw = (dyf * (xf * rstd) * s).sum(dim=(0, 1))
@@ -435,11 +439,17 @@ if _HAS_FI_NORM:
             g = weight.float() + 1.0
             var = (s * s).sum(-1, keepdim=True) / n
             rstd = torch.rsqrt(var + ctx.eps)
-            dyf = dy.float() + dres.float()  # both outputs consume s
+            # y = s * rstd * g consumes s (via rstd); res_out = s is the
+            # identity, so dres passes straight through with NO rstd
+            # correction — folding dres into the correction term (with this
+            # model's rstd ~ 30-50) was the backward explosion root cause.
+            # Both errors (extra rstd in t, dres in t) verified against a
+            # finite-difference oracle: see scratch/c6_backward_probe.py.
+            dyf = dy.float()
             A = dyf * rstd * g
-            t = (dyf * (s * rstd * g)).sum(-1, keepdim=True)
-            ds = A - (rstd * rstd * rstd) * (s / n) * t
-            dw = (dy.float() * (s * rstd)).sum(0)
+            t = (dyf * (s * g)).sum(-1, keepdim=True)
+            ds = A - (rstd * rstd * rstd) * (s / n) * t + dres.float()
+            dw = (dyf * (s * rstd)).sum(0)
             return ds.to(x0.dtype), ds.to(r0.dtype), dw.to(weight.dtype), None
 
     class _VllmGemmaRMSNorm(torch.autograd.Function):
@@ -460,7 +470,7 @@ if _HAS_FI_NORM:
             var = (xf * xf).sum(-1, keepdim=True) / n
             rstd = torch.rsqrt(var + ctx.eps)
             A = dy.float() * rstd * gf
-            t = (dy.float() * (xf * rstd * gf)).sum(-1, keepdim=True)
+            t = (dy.float() * (xf * gf)).sum(-1, keepdim=True)
             dx = A - (rstd * rstd * rstd) * (xf / n) * t
             dw = (dy.float() * (xf * rstd)).sum(0)
             return dx.to(x.dtype), dw.to(weight.dtype), None
