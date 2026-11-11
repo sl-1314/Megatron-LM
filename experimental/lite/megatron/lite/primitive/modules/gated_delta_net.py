@@ -673,7 +673,10 @@ class GatedDeltaNet(nn.Module):
     @jit_fuser
     def _compute_g_and_beta(A_log, dt_bias, alpha, beta):
         g = -A_log.exp() * F.softplus(alpha.float() + dt_bias)
-        return g, beta.sigmoid()
+        # 0-diff (qwen35-0diff-lite): beta in fp32 to match the inference-side
+        # contract (vLLM fused_post_conv_prep computes sigmoid in fp32 and feeds
+        # fp32 beta into the chunk kernel; bf16 beta diverged by ~2e-3/element).
+        return g, beta.float().sigmoid()
 
     @jit_fuser
     def _apply_gated_norm(self, x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor:
