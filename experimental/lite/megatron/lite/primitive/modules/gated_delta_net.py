@@ -466,6 +466,11 @@ if _HAS_FI_NORM:
             return dx.to(x.dtype), dw.to(weight.dtype), None
 
 
+def _vllm_pair_norm_available() -> bool:
+    """Whether the flashinfer Gemma norm kernels (the contract path) are present."""
+    return _HAS_FI_NORM
+
+
 def _vllm_pair_norm(
     x: torch.Tensor,
     residual: torch.Tensor | None,

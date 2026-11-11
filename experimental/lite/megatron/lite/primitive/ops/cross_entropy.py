@@ -110,4 +110,77 @@ def vocab_parallel_cross_entropy(vocab_parallel_logits, target, tp_group=None):
     return _VocabParallelCrossEntropy.apply(vocab_parallel_logits, target, tp_group)
 
 
-__all__ = ["vocab_parallel_cross_entropy"]
+# 0-diff (qwen35-0diff-lite): vLLM prompt-logprob contract
+# --------------------------------------------------------------------------------
+# The rollout side computes prompt logprobs with a Triton kernel
+# (vllm/v1/worker/gpu/sample/logprob.py::compute_token_logprobs ->
+# _topk_log_softmax_kernel): fp32 chunked-1024 row max, exp, per-block
+# tl.sum tree reduction accumulated sequentially, log(se), then
+# lp = logit_fp32 - max - lse.  torch.log_softmax's reduction order differs,
+# worth ~1e-7 ulp noise on ~25% of tokens.  Driving vLLM's own kernel on the
+# raw bf16 logits reproduces the engine's logprobs bitwise (verified 0/335
+# mismatch on the C3 in-engine capture).  The kernel is inference-only, so
+# gradients go through an exact analytic softmax recompute (consistency, not
+# bitwise; the engine defines no backward).
+
+_VLLM_LOGPROB_IMPORT_ERROR: str = ""
+
+
+def _vllm_compute_token_logprobs_fn():
+    """Lazily import vLLM's compute_token_logprobs; None when unavailable."""
+    global _VLLM_LOGPROB_IMPORT_ERROR
+    if _VLLM_LOGPROB_IMPORT_ERROR != "":
+        return None
+    try:
+        from vllm.v1.worker.gpu.sample.logprob import compute_token_logprobs
+
+        return compute_token_logprobs
+    except Exception as e:  # pragma: no cover - env-dependent
+        _VLLM_LOGPROB_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+        return None
+
+
+def vllm_token_logprobs_available() -> bool:
+    return _vllm_compute_token_logprobs_fn() is not None
+
+
+class _VllmTokenLogprobs(torch.autograd.Function):
+    """Bitwise vLLM Triton log-softmax forward, exact analytic backward."""
+
+    @staticmethod
+    def forward(ctx, logits, target):
+        fn = _vllm_compute_token_logprobs_fn()
+        assert fn is not None
+        # The kernel wants [rows, V] with a contiguous last dim and [rows, 1]
+        # int64 ids; the math is per-row, so any leading layout flattens
+        # losslessly.
+        rows = logits.reshape(-1, logits.shape[-1]).contiguous()
+        ids = target.reshape(-1, 1).to(torch.int64).contiguous()
+        lp = fn(rows, ids).view(-1)
+        ctx.save_for_backward(logits, target)
+        return lp.view_as(target)
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        logits, target = ctx.saved_tensors
+        with torch.enable_grad():
+            lg = logits.detach().float().requires_grad_(True)
+            lsm = torch.log_softmax(lg, dim=-1)
+            ids = target.reshape(-1).to(torch.int64)
+            flat = lsm.reshape(-1, lg.shape[-1])
+            lp = flat[torch.arange(ids.numel(), device=ids.device), ids].view_as(target)
+            (grad,) = torch.autograd.grad(lp, lg, grad_out)
+        return grad.to(logits.dtype), None
+
+
+def vllm_token_logprobs(logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Per-position log-probs (shape of ``target``, fp32) — vLLM bitwise.
+
+    ``logits`` must be the raw (un-tempered) GEMM output in the engine's
+    dtype; ``target`` entries must be valid vocab ids (unlike the vocab CE
+    the kernel does not clamp out-of-range ids).
+    """
+    return _VllmTokenLogprobs.apply(logits, target)
+
+
+__all__ = ["vocab_parallel_cross_entropy", "vllm_token_logprobs", "vllm_token_logprobs_available"]

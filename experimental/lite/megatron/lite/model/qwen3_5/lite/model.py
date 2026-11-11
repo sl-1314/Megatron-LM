@@ -33,7 +33,11 @@ from megatron.lite.primitive.modules.mtp import (
     roll_mtp_tensor_left,
 )
 from megatron.lite.primitive.modules.router import TopKRouter
-from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
+from megatron.lite.primitive.ops.cross_entropy import (
+    vllm_token_logprobs,
+    vllm_token_logprobs_available,
+    vocab_parallel_cross_entropy,
+)
 from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.ops.logprob import vocab_parallel_entropy
 from megatron.lite.primitive.parallel import (
@@ -547,6 +551,10 @@ class Qwen35Model(nn.Module):
                 config.hidden_size, eps=config.rms_norm_eps, zero_centered_gamma=True
             )
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
+            self._norm_eps = config.rms_norm_eps
+            self._vllm_head_norm_contract = (
+                _GDN_HAS_FI_NORM and ps.tp_size == 1
+            )
 
         self.mtp_embed: VocabParallelEmbedding | None = None
         self.mtp: MTPBlock | None = None
@@ -644,44 +652,91 @@ class Qwen35Model(nn.Module):
                     position_ids=position_ids,
                     packed_seq_params=packed_seq_params,
                 )
-            if residual is not None:
-                h = residual + h
 
-        output = {"hidden_states": h}
+        output: dict = {}
         if self.head is not None:
             assert self.norm is not None
-            hidden_for_head = self.norm(h)
-            if labels is not None:
-                temperature_value = _temperature_to_float(temperature)
-                mtp_result = self._apply_mtp_loss(
-                    hidden_for_head,
-                    input_ids=input_ids,
-                    position_ids=position_ids,
-                    labels=labels,
-                    loss_mask=loss_mask,
-                    packed_seq_params=packed_seq_params,
-                    temperature=temperature_value,
-                    use_fused_kernels=use_fused_kernels,
+            # 0-diff (qwen35-0diff-lite): the engine's final norm is the
+            # flashinfer Gemma fused-add rmsnorm applied to the UN-ADDED
+            # pair — the fp32 sum lives only inside the kernel, so bf16-add
+            # + te.RMSNorm rounds once more and offsets the weight by the
+            # (gamma-1) double rounding.  The contract is bitwise (verified
+            # 0/335 logprob mismatch on the C3 capture); residual_out
+            # bf16(fp32 sum) equals the plain bf16 add, so the reported
+            # hidden_states are unchanged.
+            if (
+                self._vllm_head_norm_contract
+                and residual is not None
+                and h.dtype == torch.bfloat16
+            ):
+                hidden_for_head, h_sum = _vllm_pair_norm(
+                    h, residual, self.norm.weight, self._norm_eps
                 )
-                if mtp_result is not None:
-                    hidden_for_head, mtp_loss = mtp_result
-                    output["mtp_loss"] = mtp_loss
-                labels_sb = labels.transpose(0, 1).contiguous()
-                if use_fused_kernels:
-                    hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
-                    log_probs, entropy = linear_cross_entropy(
-                        hidden_full,
-                        self._head_weight_for_fused_ce(hidden_full),
-                        labels_sb,
-                        temperature_value,
-                        self.ps.tp_group,
-                    )
+                output["hidden_states"] = h_sum
+            else:
+                if residual is not None:
+                    h = residual + h
+                output["hidden_states"] = h
+                hidden_for_head = self.norm(h)
+        else:
+            if residual is not None:
+                h = residual + h
+            output["hidden_states"] = h
+        if self.head is not None and labels is not None:
+            temperature_value = _temperature_to_float(temperature)
+            mtp_result = self._apply_mtp_loss(
+                hidden_for_head,
+                input_ids=input_ids,
+                position_ids=position_ids,
+                labels=labels,
+                loss_mask=loss_mask,
+                packed_seq_params=packed_seq_params,
+                temperature=temperature_value,
+                use_fused_kernels=use_fused_kernels,
+            )
+            if mtp_result is not None:
+                hidden_for_head, mtp_loss = mtp_result
+                output["mtp_loss"] = mtp_loss
+            labels_sb = labels.transpose(0, 1).contiguous()
+            if use_fused_kernels:
+                hidden_full = gather_from_sequence_parallel(hidden_for_head, self.ps)
+                log_probs, entropy = linear_cross_entropy(
+                    hidden_full,
+                    self._head_weight_for_fused_ce(hidden_full),
+                    labels_sb,
+                    temperature_value,
+                    self.ps.tp_group,
+                )
+                output["loss"] = (-log_probs).mean()
+                output["log_probs"] = log_probs.transpose(0, 1).contiguous()
+                if calculate_entropy:
+                    output["entropy"] = entropy.transpose(0, 1).contiguous()
+            else:
+                logits = self.head(hidden_for_head)
+                # 0-diff (qwen35-0diff-lite): vLLM prompt-logprob contract —
+                # drive the engine's own Triton chunked log-softmax kernel
+                # on the RAW bf16 logits (no temperature; the engine's
+                # raw_logprobs mode applies none).  Bitwise vs the engine
+                # (0/335 on the C3 capture); torch CE differs by ~1e-7 ulp
+                # noise.  The kernel does not clamp ids, so gate on label
+                # validity.  Backward is an exact analytic softmax.
+                labels_valid = bool(
+                    (labels_sb >= 0).all() and (labels_sb < self.config.vocab_size).all()
+                )
+                if (
+                    self._vllm_head_norm_contract
+                    and temperature_value == 1.0
+                    and labels_valid
+                    and vllm_token_logprobs_available()
+                    and logits.dtype == torch.bfloat16
+                ):
+                    log_probs = vllm_token_logprobs(logits, labels_sb)
                     output["loss"] = (-log_probs).mean()
                     output["log_probs"] = log_probs.transpose(0, 1).contiguous()
                     if calculate_entropy:
+                        entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
                 else:
-                    logits = self.head(hidden_for_head)
                     if temperature_value != 1.0:
                         logits = logits / temperature_value
                     loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
@@ -690,9 +745,9 @@ class Qwen35Model(nn.Module):
                     if calculate_entropy:
                         entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
-            else:
-                logits = self.head(hidden_for_head)
-                output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
+        elif self.head is not None:
+            logits = self.head(hidden_for_head)
+            output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
         return output
 
     def _apply_mtp_loss(
