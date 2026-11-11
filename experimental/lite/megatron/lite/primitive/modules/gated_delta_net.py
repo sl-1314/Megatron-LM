@@ -96,6 +96,16 @@ try:
 except ImportError:
     _HAS_TRITON = False
 
+try:
+    from flashinfer.norm import (  # pyright: ignore[reportMissingImports]
+        gemma_fused_add_rmsnorm as _fi_gemma_fused_add_rmsnorm,
+        gemma_rmsnorm as _fi_gemma_rmsnorm,
+    )
+
+    _HAS_FI_NORM = True
+except Exception:
+    _HAS_FI_NORM = False
+
 
 # 0-diff (qwen35-0diff-lite): vLLM causal-conv contract replication -----------------
 #
@@ -257,62 +267,104 @@ def _vllm_g_beta(alpha: torch.Tensor, beta: torch.Tensor, A_log: torch.Tensor, d
     return g.view(shape), b.view(shape)
 
 
-# 0-diff (qwen35-0diff-lite): vLLM RMSNormGated contract -------------------------------
+# 0-diff (qwen35-0diff-lite): vLLM gated output-norm contract -------------------------
 #
-# vLLM's gated output norm is the Triton layer_norm_fwd_kernel
-# (vllm/third_party/flash_linear_attention/ops/layernorm_guard.py, RMS mode,
-# norm_before_gate=True, silu) which stays in fp32 end to end and rounds to
-# bf16 ONCE:
-#   x fp32; var = sum(x*x)/N; rstd = rsqrt(var+eps)
-#   y = (x*rstd) * gamma;  y *= z * sigmoid(z);  store bf16
-# mlite's te.RMSNorm rounds its output to bf16 BEFORE the gate multiply
-# (double rounding), and TE's reduction/rsqrt differ from Triton by ulps —
-# together 26% of elements at up to 1.6e-2.  mlite stores the zero-centered
-# weight (gamma-1) for te.RMSNorm; fp32(w)+1 == gamma bitwise, so the kernel
-# adds 1 back in fp32.
+# vLLM (nvidia variant) runs the fused Triton kernel
+# vllm/models/qwen3_5/nvidia/ops/fused_gdn_gated_norm.py: per-head RMS norm,
+# fp32 end to end, ONE bf16 rounding:
+#   x fp32; xbar = where(mask, x, 0); var = sum(xbar*xbar)/N
+#   rstd = rsqrt(var+eps); y = x*rstd*w;  y *= z*sigmoid(z);  store bf16
+# launched as grid=(cdiv(M, ROWS_PER_BLOCK), num_v_heads), num_warps=1,
+# ROWS_PER_BLOCK = calc_rows_per_block(M) — the kernel below is a verbatim
+# port of that source (same signature, strides, constexprs, launch config),
+# verified bitwise against the in-engine capture.
+#
+# Weight convention (the subtle one): the HF checkpoint stores
+# linear_attn.norm.weight in FP32 (plain gamma), and vLLM loads it into a
+# bf16 parameter, so the kernel consumes fp32(bf16(gamma)).  mlite stores the
+# zero-centered bf16(gamma - 1) for te.RMSNorm, from which bf16(gamma) is NOT
+# recoverable (double rounding), so load_hf_weights additionally caches the
+# raw bf16 value in GDN._vllm_norm_w.  The analytic backward computes the
+# gradient w.r.t. gamma and returns it straight to the zero-centered param
+# (d(gamma)/d(w) = 1, STE through both bf16 roundings).
+#
+# mlite's legacy te.RMSNorm path rounds to bf16 BEFORE the gate multiply and
+# TE's reduction differs — together 26% of elements at up to 1.6e-2.
 
 if _HAS_TRITON:
 
-    @triton.jit
+    def _vllm_calc_rows_per_block(M: int, device: torch.device) -> int:
+        # Port of layernorm_guard.calc_rows_per_block (num_compute_units ==
+        # multi_processor_count on CUDA).
+        import math
+
+        sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+        return min(triton.next_power_of_2(math.ceil(M / (2 * sm_count))), 4)
+
+    @triton.jit(do_not_specialize=["M"])
     def _vllm_gated_norm_kernel(
-        x_ptr, z_ptr, w_ptr, y_ptr, M, eps,
-        N: tl.constexpr, BN: tl.constexpr, BLOCK_M: tl.constexpr,
+        x_ptr, z_ptr, w_ptr, out_ptr,
+        stride_x_tok, stride_z_tok, stride_out_tok,
+        M, eps,
+        N: tl.constexpr, BLOCK_N: tl.constexpr, ROWS_PER_BLOCK: tl.constexpr,
+        NORM_BEFORE_GATE: tl.constexpr, ACTIVATION: tl.constexpr,
     ):
-        pid = tl.program_id(0)
-        rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
-        cols = tl.arange(0, BN)
-        mask = (rows[:, None] < M) & (cols[None, :] < N)
-        offs = rows[:, None] * N + cols[None, :]
-        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        z = tl.load(z_ptr + offs, mask=mask, other=0.0).to(tl.float32)
-        w = tl.load(w_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
-        var = tl.sum(x * x, axis=1) / N
+        row_start = tl.program_id(0) * ROWS_PER_BLOCK
+        head = tl.program_id(1)
+        rows = row_start + tl.arange(0, ROWS_PER_BLOCK)
+        cols = tl.arange(0, BLOCK_N)
+        row_mask = rows[:, None] < M
+        col_mask = cols[None, :] < N
+        mask = row_mask & col_mask
+        x_ptrs = x_ptr + rows[:, None] * stride_x_tok + head * N + cols[None, :]
+        z_ptrs = z_ptr + rows[:, None] * stride_z_tok + head * N + cols[None, :]
+        x = tl.load(x_ptrs, mask=mask, other=0.0).to(tl.float32)
+        xbar = tl.where(mask, x, 0.0)
+        var = tl.sum(xbar * xbar, axis=1) / N
         rstd = tl.rsqrt(var + eps)
-        y = x * rstd[:, None] * (w + 1.0)[None, :]
+        w = tl.load(w_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+        y = x * rstd[:, None] * w[None, :]
+        z = tl.load(z_ptrs, mask=mask, other=0.0).to(tl.float32)
         y = y * (z * tl.sigmoid(z))
-        tl.store(y_ptr + offs, y.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=mask)
+        out_ptrs = out_ptr + rows[:, None] * stride_out_tok + head * N + cols[None, :]
+        tl.store(out_ptrs, y.to(out_ptr.dtype.element_ty), mask=mask)
 
     class _VllmGatedNorm(torch.autograd.Function):
-        """Contract-exact gated RMSNorm (Triton forward, analytic fp32 backward)."""
+        """Contract-exact gated RMSNorm (verbatim Triton forward, fp32 backward).
+
+        ``w_raw`` is the vLLM-convention weight (bf16 gamma); ``w_param`` is
+        the trainable zero-centered param that receives the gamma gradient.
+        """
 
         @staticmethod
-        def forward(ctx, x, z, w, eps):
-            m, n = x.shape
-            y = torch.empty(m, n, device=x.device, dtype=torch.bfloat16)
-            _vllm_gated_norm_kernel[(triton.cdiv(m, 8),)](
-                x, z, w, y, m, eps, N=n, BN=triton.next_power_of_2(n), BLOCK_M=8
+        def forward(ctx, x, z, w_param, w_raw, eps):
+            num_tokens, width = x.shape
+            num_v_heads = width // w_raw.shape[0]
+            out = torch.empty_like(x)
+            block_n = triton.next_power_of_2(w_raw.shape[0])
+            rows_per_block = _vllm_calc_rows_per_block(num_tokens, x.device)
+            grid = (triton.cdiv(num_tokens, rows_per_block), num_v_heads)
+            _vllm_gated_norm_kernel[grid](
+                x, z, w_raw, out,
+                x.stride(0), z.stride(0), out.stride(0),
+                num_tokens, eps,
+                N=w_raw.shape[0], BLOCK_N=block_n, ROWS_PER_BLOCK=rows_per_block,
+                NORM_BEFORE_GATE=True, ACTIVATION="silu",
+                num_warps=min(max(block_n // 256, 1), 8),
             )
-            ctx.save_for_backward(x, z, w)
+            ctx.save_for_backward(x, z, w_raw)
             ctx.eps = eps
-            return y
+            return out
 
         @staticmethod
         def backward(ctx, dy):
-            x, z, w = ctx.saved_tensors
-            n = x.shape[-1]
-            xf, zf = x.float(), z.float()
-            wf = w.float() + 1.0
-            dyf = dy.float()
+            x, z, w_raw = ctx.saved_tensors
+            n = w_raw.shape[0]
+            hv = z.shape[-1] // n
+            xf = x.float().view(-1, hv, n)
+            zf = z.float().view(-1, hv, n)
+            wf = w_raw.float()
+            dyf = dy.float().view(-1, hv, n)
             var = (xf * xf).sum(-1, keepdim=True) / n
             rstd = torch.rsqrt(var + ctx.eps)
             sig = torch.sigmoid(zf)
@@ -321,17 +373,136 @@ if _HAS_TRITON:
             t = (dyf * (xf * rstd * wf * s)).sum(-1, keepdim=True)
             dx = A - (rstd * rstd * rstd) * (xf / n) * t
             dz = dyf * (xf * rstd * wf) * (sig * (1.0 + zf * (1.0 - sig)))
-            dw = (dyf * (xf * rstd) * s).sum(0)
-            return dx.to(x.dtype), dz.to(x.dtype), dw.to(w.dtype), None
+            dw = (dyf * (xf * rstd) * s).sum(dim=(0, 1))
+            return (
+                dx.view_as(x).to(x.dtype),
+                dz.view_as(z).to(z.dtype),
+                dw.to(w_raw.dtype),  # STE: d(gamma)/d(zero-centered w) == 1
+                None,
+                None,
+            )
 
 
-def _vllm_gated_norm(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float):
-    """Bit-exact vLLM RMSNormGated(silu) for bf16 ``[..., N]`` x/gate inputs."""
+def _vllm_gated_norm(
+    x: torch.Tensor,
+    gate: torch.Tensor,
+    w_param: torch.Tensor,
+    w_raw: torch.Tensor,
+    eps: float,
+):
+    """Bit-exact vLLM fused gated RMSNorm for bf16 ``[..., HV, V]`` x/gate."""
     shape = x.shape
-    n = shape[-1]
-    x2 = x.reshape(-1, n).contiguous()
-    g2 = gate.reshape(-1, n).contiguous()
-    return _VllmGatedNorm.apply(x2, g2, weight, eps).view(shape)
+    width = shape[-1] * shape[-2]  # HV * V
+    x2 = x.reshape(-1, width).contiguous()
+    g2 = gate.reshape(-1, width).contiguous()
+    return _VllmGatedNorm.apply(x2, g2, w_param, w_raw, eps).view(shape)
+
+
+# 0-diff (qwen35-0diff-lite): vLLM fused input-norm contract ---------------------------
+#
+# The rollout side (vllm/models/qwen3_5/nvidia/model.py Qwen3_5RMSNorm) norms
+# the exact fp32 sum  s = fp32(x) + fp32(residual)  inside flashinfer's Gemma
+# fused add+RMSNorm (Gemma weight: y = x_hat * (w + 1)), writes the residual
+# stream back as bf16(s), and feeds the bf16 normed activation to the plain
+# gemm.  Once the caller pre-adds the pair in bf16 the exact fp32 sum is lost,
+# so the layer must hand the UN-ADDED pair down.  flashinfer is invoked
+# directly (same kernel -> bitwise), with an analytic fp32 backward for
+# training: y = s * rstd * (w+1) elementwise, res_out = round_bf16(s) treated
+# as s (STE through the rounding).
+
+if _HAS_FI_NORM:
+
+    class _VllmGemmaFusedAddRmsNorm(torch.autograd.Function):
+        """flashinfer gemma_fused_add_rmsnorm with analytic fp32 backward.
+
+        Inputs are [N, H] bf16 contiguous; the kernel updates ``x`` in place
+        (-> normed y) and ``residual`` in place (-> bf16(s)).  Forward clones
+        the pre-kernel pair so backward can recover s = fp32(x)+fp32(res).
+        """
+
+        @staticmethod
+        def forward(ctx, x, residual, weight, eps):
+            ctx.save_for_backward(x.clone(), residual.clone(), weight)
+            _fi_gemma_fused_add_rmsnorm(x, residual, weight, eps)
+            ctx.eps = eps
+            return x, residual
+
+        @staticmethod
+        def backward(ctx, dy, dres):
+            x0, r0, weight = ctx.saved_tensors
+            n = x0.shape[-1]
+            s = x0.float() + r0.float()
+            g = weight.float() + 1.0
+            var = (s * s).sum(-1, keepdim=True) / n
+            rstd = torch.rsqrt(var + ctx.eps)
+            dyf = dy.float() + dres.float()  # both outputs consume s
+            A = dyf * rstd * g
+            t = (dyf * (s * rstd * g)).sum(-1, keepdim=True)
+            ds = A - (rstd * rstd * rstd) * (s / n) * t
+            dw = (dy.float() * (s * rstd)).sum(0)
+            return ds.to(x0.dtype), ds.to(r0.dtype), dw.to(weight.dtype), None
+
+    class _VllmGemmaRMSNorm(torch.autograd.Function):
+        """flashinfer gemma_rmsnorm (no residual) with analytic fp32 backward."""
+
+        @staticmethod
+        def forward(ctx, x, weight, eps):
+            y = _fi_gemma_rmsnorm(x, weight, eps)
+            ctx.save_for_backward(x, weight)
+            ctx.eps = eps
+            return y
+
+        @staticmethod
+        def backward(ctx, dy):
+            x, weight = ctx.saved_tensors
+            n = x.shape[-1]
+            xf, gf = x.float(), weight.float() + 1.0
+            var = (xf * xf).sum(-1, keepdim=True) / n
+            rstd = torch.rsqrt(var + ctx.eps)
+            A = dy.float() * rstd * gf
+            t = (dy.float() * (xf * rstd * gf)).sum(-1, keepdim=True)
+            dx = A - (rstd * rstd * rstd) * (xf / n) * t
+            dw = (dy.float() * (xf * rstd)).sum(0)
+            return dx.to(x.dtype), dw.to(weight.dtype), None
+
+
+def _vllm_pair_norm(
+    x: torch.Tensor,
+    residual: torch.Tensor | None,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """vLLM input-norm contract on an UN-ADDED (x, residual) pair.
+
+    Returns (y, residual_out): y is the bf16 normed activation (Gemma
+    x_hat*(w+1) on the exact fp32 sum), residual_out is the updated stream
+    bf16(fp32(x)+fp32(residual)).  With ``residual=None`` y = gemma_rmsnorm(x)
+    and residual_out is x itself (vLLM starts the stream at the input).
+    """
+    shape = x.shape
+    # clone: contiguous() may return the caller's own tensor and the
+    # flashinfer kernel writes x/residual in place.
+    x2 = x.reshape(-1, shape[-1]).contiguous().clone()
+    w2 = weight.contiguous()
+    if residual is None:
+        if _HAS_FI_NORM:
+            y = _VllmGemmaRMSNorm.apply(x2, w2, eps)
+        else:  # pragma: no cover - fallback parity, not contract-exact
+            xf = x2.float()
+            y = (xf * torch.rsqrt((xf * xf).mean(-1, keepdim=True) + eps) * (w2.float() + 1.0)).to(
+                x2.dtype
+            )
+        return y.view(shape), x
+    res2 = residual.reshape(-1, shape[-1]).contiguous().clone()
+    if _HAS_FI_NORM:
+        y, res_out = _VllmGemmaFusedAddRmsNorm.apply(x2, res2, w2, eps)
+    else:  # pragma: no cover - fallback parity, not contract-exact
+        s = x2.float() + res2.float()
+        y = (s * torch.rsqrt((s * s).mean(-1, keepdim=True) + eps) * (w2.float() + 1.0)).to(
+            x2.dtype
+        )
+        res_out = s.to(res2.dtype)
+    return y.view(shape), res_out.view(shape)
 
 
 # ------------------------------------------------------------------------------------
@@ -419,6 +590,7 @@ class GatedDeltaNet(nn.Module):
             eps=rms_norm_eps,
             zero_centered_gamma=True,
         )
+        self._in_norm_eps = rms_norm_eps  # 0-diff: vLLM input-norm contract eps
         conv_dim_local = (
             ensure_divisible(self.qk_dim * 2 + self.v_dim, ps.tp_size)
             if self._replicate_heads
@@ -444,6 +616,13 @@ class GatedDeltaNet(nn.Module):
             else torch.zeros(self.num_v_heads_local, dtype=torch.float32)
         )
         self.norm = te.RMSNorm(self.dv, eps=rms_norm_eps, zero_centered_gamma=True)
+        # 0-diff: raw bf16 gamma cache (vLLM loads the fp32 checkpoint value
+        # into a bf16 param; bf16(gamma) is not recoverable from the
+        # zero-centered param) — filled by the checkpoint post-load hook.
+        self.register_buffer(
+            "_vllm_norm_w", torch.zeros(self.dv, dtype=torch.bfloat16), persistent=False
+        )
+        self._vllm_norm_w_loaded = False
         self.o_proj = RowParallelLinear(self.v_dim, hidden_size, ps, bias=False)
         # (global cu_seqlens, FLA cp_context) keyed on (seq_len_global, batch, device)
         # for the non-packed chunkwise path, where both are static across forwards.
@@ -482,11 +661,43 @@ class GatedDeltaNet(nn.Module):
         return [self.qk_dim_local, self.qk_dim_local, self.v_dim_local]
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(o_proj output, residual stream)`` — both UN-ADDED.
+
+        ``residual`` (when given) is the un-added running stream: the vLLM
+        input-norm contract consumes the exact fp32 (x + residual) inside the
+        norm, so the caller must not pre-add the pair.
+        """
         del position_ids
         is_packed = packed_seq_params is not None
-        qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
+        # 0-diff (qwen35-0diff-lite): vLLM input-norm contract. flashinfer's
+        # Gemma fused add+RMSNorm on the UN-ADDED pair plus a plain F.linear
+        # gemm — both bitwise-verified against the in-engine capture (the
+        # gemm equals vLLM's in_proj_qkvz/in_proj_ba pair). te.LayerNormLinear
+        # instead norms the bf16 pre-added stream (exact fp32 sum lost at the
+        # add) with TE's own norm arithmetic: 51% of in_proj outputs diverged
+        # on captured data. TP>1 needs the deferred-all-reduce norm variant
+        # and a column-sharded gemm — not contract-covered yet.
+        if _HAS_FI_NORM and self.ps.tp_size == 1 and not self._replicate_heads:
+            y, residual = _vllm_pair_norm(
+                x, residual, self.in_proj.linear.layer_norm_weight, self._in_norm_eps
+            )
+            qkvzba = (
+                F.linear(y.reshape(-1, y.shape[-1]), self.in_proj.linear.weight)
+                .view(x.shape[0], x.shape[1], -1)
+                .transpose(0, 1)
+                .contiguous()
+            )
+        else:
+            if residual is not None:
+                x = residual + x
+            residual = x
+            qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
         if self._replicate_heads:
             qkvzba = all_gather_last_dim_with_grad_reduce(qkvzba, self.ps.tp_group)
         cu_seqlens = self._packed_cu_seqlens(packed_seq_params) if is_packed else None
@@ -595,15 +806,25 @@ class GatedDeltaNet(nn.Module):
             cp_context=cp_context,
         )
 
-        # 0-diff (qwen35-0diff-lite): vLLM RMSNormGated contract (fp32 through
-        # the gate multiply, single bf16 rounding) — see _vllm_gated_norm above.
+        # 0-diff (qwen35-0diff-lite): vLLM fused gated-norm contract (fp32
+        # through the gate multiply, single bf16 rounding, raw bf16 gamma) —
+        # see _vllm_gated_norm above.
         if (
             _HAS_TRITON
             and out.dtype == torch.bfloat16
             and gate.dtype == torch.bfloat16
             and out.shape[-1] == self.dv
         ):
-            out = _vllm_gated_norm(out, gate, self.norm.weight, getattr(self.norm, "eps", 1e-6))
+            if self._vllm_norm_w_loaded:
+                w_raw = self._vllm_norm_w
+            else:
+                # fallback for weights not loaded via the 0-diff hook (unit
+                # tests / scratch init): approximate bf16(gamma) from the
+                # zero-centered param — NOT bit-exact.
+                w_raw = (self.norm.weight.detach().float() + 1.0).to(torch.bfloat16)
+            out = _vllm_gated_norm(
+                out, gate, self.norm.weight, w_raw, getattr(self.norm, "eps", 1e-6)
+            )
         else:
             out = self._apply_gated_norm(out, gate)
         out = out.reshape(
@@ -623,7 +844,7 @@ class GatedDeltaNet(nn.Module):
                 out = self._headwise_hp2cp(out, cu_seqlens)
             batch, seq_len = out.shape[:2]
         out = out.transpose(0, 1).contiguous()
-        return self.o_proj(out)
+        return self.o_proj(out), residual
 
     def _state_parameters_for_tp(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return replicated GDN state with a TP gradient all-reduce."""

@@ -797,6 +797,50 @@ def load_hf_weights(
     )
 
     _load(model, path, Qwen35WeightSpec(config), ps, vocab_size=config.vocab_size)
+    _cache_vllm_norm_weights(model, path, config)
+
+
+def _cache_vllm_norm_weights(
+    model: nn.Module, path: str, config: Qwen35Config
+) -> None:
+    """0-diff: fill each GDN's raw bf16 gamma cache (``_vllm_norm_w``).
+
+    vLLM loads the fp32 checkpoint ``linear_attn.norm.weight`` into a bf16
+    parameter and its fused kernel consumes that bf16 value (the pointer
+    dtype is part of the Triton specialization, so fp32 vs bf16 changes the
+    compiled binary and the results).  bf16(gamma) is not recoverable from
+    the zero-centered te.RMSNorm weight, so cache the RTNE-cast raw value
+    for the contract path (see gated_delta_net._vllm_gated_norm).
+
+    MTP modules (``mtp.*``) have no mapping in this spec and are skipped.
+    """
+    targets = [
+        (name, module)
+        for name, module in model.named_modules()
+        if isinstance(getattr(module, "_vllm_norm_w", None), torch.Tensor)
+        and not (name.startswith("mtp") or ".mtp." in name)
+    ]
+    if not targets:
+        return
+    from megatron.lite.primitive.ckpt.hf_weights import (  # isort: skip
+        SafeTensorReader,
+    )
+
+    text_prefix = config.hf_text_prefix
+    with SafeTensorReader(path) as reader:
+        for name, module in targets:
+            match = re.search(r"layers\.(\d+)\.linear_attn$", name)
+            if match is None:
+                continue
+            hf_name = f"{text_prefix}.layers.{match.group(1)}.linear_attn.norm.weight"
+            if not reader.has_tensor(hf_name):
+                continue
+            gamma = reader.get_tensor(hf_name, device=module._vllm_norm_w.device)
+            module._vllm_norm_w.copy_(gamma)
+            module._vllm_norm_w_loaded = True
+    logging.getLogger(__name__).debug(
+        "cached vLLM raw bf16 norm weights for %d GDN layer(s)", len(targets)
+    )
 
 
 def export_hf_weights(

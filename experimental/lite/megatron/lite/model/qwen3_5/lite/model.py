@@ -19,6 +19,10 @@ from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
+from megatron.lite.primitive.modules.gated_delta_net import (
+    _HAS_FI_NORM as _GDN_HAS_FI_NORM,
+)
+from megatron.lite.primitive.modules.gated_delta_net import _vllm_pair_norm
 from megatron.lite.primitive.modules.gqa import GQAttention as FullAttention
 from megatron.lite.primitive.modules.gqa import split_grouped_qkvg as _split_grouped_qkvg
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding as Qwen35MRoPE
@@ -266,6 +270,8 @@ class Qwen35Layer(nn.Module):
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.ps = ps
+        self._norm_eps = config.rms_norm_eps
         self._layer_type = config.layer_type_at(layer_idx)
         self.full_attn: FullAttention | None = None
         self.linear_attn: GatedDeltaNet | None = None
@@ -325,21 +331,48 @@ class Qwen35Layer(nn.Module):
             self.mlp = DenseMLP(config, ps)
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
-    ) -> torch.Tensor:
-        residual = x
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        residual: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns ``(module output, residual stream)``, both UN-ADDED.
+
+        0-diff (qwen35-0diff-lite): vLLM keeps the residual stream un-added
+        between sublayers and lets each Gemma fused add+RMSNorm consume the
+        exact fp32 (x + residual) inside the kernel. Pre-adding in bf16 loses
+        the exact sum and diverged 51% of in_proj outputs on captured data,
+        so the model loop now carries the (h, residual) pair.
+        """
         if self.full_attn is not None:
-            h = self.full_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
+            # FA layers keep the legacy pre-added input until their norm is
+            # contract-aligned (needs flash_attn, see EVENTLOG).
+            xs = x if residual is None else residual + x
+            h = self.full_attn(xs, position_ids=position_ids, packed_seq_params=packed_seq_params)
+            residual = xs
         else:
             assert self.linear_attn is not None
-            h = self.linear_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
-        x = residual + h
-        residual = x
+            h, residual = self.linear_attn(
+                x,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                residual=residual,
+            )
         if self.moe is not None:
             assert self.mlp_norm is not None
-            return residual + self.moe(self.mlp_norm(x))
+            # 0-diff (qwen35-0diff-lite): vLLM post-attention norm contract
+            # (flashinfer Gemma fused add+RMSNorm on the fp32 sum), TP=1 only.
+            if _GDN_HAS_FI_NORM and self.ps.tp_size == 1:
+                y, residual = _vllm_pair_norm(
+                    h, residual, self.mlp_norm.weight, self._norm_eps
+                )
+                return self.moe(y), residual
+            xs = h if residual is None else residual + h
+            return self.moe(self.mlp_norm(xs)), xs
         assert self.mlp is not None
-        return residual + self.mlp(x)
+        xs = h if residual is None else residual + h
+        return self.mlp(xs), xs
 
 
 def _temperature_to_float(temperature: float | torch.Tensor) -> float:
@@ -545,8 +578,19 @@ class Qwen35Model(nn.Module):
         with fp8_ctx:
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
+            # 0-diff (qwen35-0diff-lite): carry the UN-ADDED (h, residual) pair
+            # through the stack; each layer's fused norms consume the exact
+            # fp32 sum (vLLM layout). See Qwen35Layer.forward.
+            residual = None
             for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                h, residual = layer(
+                    h,
+                    residual=residual,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                )
+            if residual is not None:
+                h = residual + h
 
         output = {"hidden_states": h}
         if self.head is not None:

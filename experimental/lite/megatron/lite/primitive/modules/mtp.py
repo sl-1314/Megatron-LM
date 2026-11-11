@@ -104,9 +104,11 @@ class MTPDecoderLayer(nn.Module):
         hidden_states = self.hnorm(hidden_states)
         hidden_states = torch.cat((decoder_input, hidden_states), dim=-1)
         hidden_states = scatter_to_sequence_parallel(self.eh_proj(hidden_states), self.ps)
-        hidden_states = self.transformer_layer(
+        hidden_states, _residual = self.transformer_layer(
             hidden_states, position_ids=attention_position_ids, packed_seq_params=packed_seq_params
         )
+        if _residual is not None:
+            hidden_states = hidden_states + _residual
         hidden_states = self.final_layernorm(hidden_states)
         return hidden_states, input_ids, position_ids
 
