@@ -88,6 +88,97 @@ _CONV_PAD_ALIGNMENT = 4096
 
 _CP_MODES = {"headwise", "chunkwise"}
 
+try:
+    import triton  # pyright: ignore[reportMissingImports]
+    import triton.language as tl  # pyright: ignore[reportMissingImports]
+
+    _HAS_TRITON = True
+except ImportError:
+    _HAS_TRITON = False
+
+
+# 0-diff (qwen35-0diff-lite): vLLM causal-conv contract replication -----------------
+#
+# The rollout contract owner is vLLM's Triton kernel
+# (vllm/model_executor/layers/mamba/ops/causal_conv1d.py).  For a bf16, no-bias,
+# silu conv of width W its arithmetic is:
+#   acc = 0 (fp32)
+#   for j in 0..W-1 (oldest -> newest):
+#       acc += bf16(x) * bf16(w)          # product ROUNDED TO BF16, then fp32 add
+#   out = bf16( acc / (1 + exp(-acc)) )   # silu in fp32
+# The fla 0.6 kernel multiplies in fp32 (no product rounding), which alone
+# accounts for the entire ~7e-5 absmean cross-side conv diff.  The torch
+# elementwise bf16 mul rounds identically to Triton's, so the accumulation is
+# plain torch; the silu, however, must run through Triton — torch.exp/torch.div
+# differ from tl.exp/'/' by 1 fp32 ulp on rare values, which flips the bf16
+# rounding at exact midpoints (~1e-6 of elements).
+
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _vllm_conv_silu_kernel(acc_ptr, out_ptr, n, BLOCK: tl.constexpr):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        acc = tl.load(acc_ptr + offs, mask=mask)
+        y = acc / (1 + tl.exp(-acc))
+        tl.store(out_ptr + offs, y.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=mask)
+
+    class _VllmConvSilu(torch.autograd.Function):
+        """Contract-exact silu (Triton forward, analytic fp32 backward)."""
+
+        @staticmethod
+        def forward(ctx, acc: torch.Tensor) -> torch.Tensor:
+            ctx.save_for_backward(acc)
+            n = acc.numel()
+            out = torch.empty(n, device=acc.device, dtype=torch.bfloat16)
+            _vllm_conv_silu_kernel[(triton.cdiv(n, 1024),)](
+                acc.reshape(-1).contiguous(), out, n, BLOCK=1024
+            )
+            return out.view_as(acc)
+
+        @staticmethod
+        def backward(ctx, grad_out: torch.Tensor):
+            (acc,) = ctx.saved_tensors
+            s = torch.sigmoid(acc)
+            grad = (s + acc * s * (1 - s)) * grad_out.to(torch.float32)
+            return grad.to(acc.dtype)
+
+
+def _vllm_conv1d_silu(
+    x: torch.Tensor, weight: torch.Tensor, cu_seqlens: torch.Tensor | None
+) -> torch.Tensor:
+    """Bit-exact vLLM causal_conv1d (no bias, silu) for bf16 [B, T, D] input.
+
+    ``weight`` is [D, W].  With ``cu_seqlens`` (THD packing, B=1) each sequence
+    zero-pads at its own start; otherwise each batch row does.
+    """
+    B, T, D = x.shape
+    W = weight.shape[-1]
+    if cu_seqlens is not None:
+        assert B == 1, "THD packing requires a single batch row"
+        acc = torch.zeros(T, D, device=x.device, dtype=torch.float32)
+        pos = torch.arange(T, device=x.device)
+        # sequence start of each packed position
+        seq_id = torch.searchsorted(cu_seqlens, pos, right=True) - 1
+        starts = cu_seqlens[seq_id]
+        x0 = x[0]
+        for j in range(W):
+            idx = pos - (W - 1 - j)
+            xj = x0[idx.clamp(min=0)]
+            xj = torch.where((idx >= starts)[:, None], xj, torch.zeros_like(xj))
+            acc = acc + (xj * weight[:, j]).float()
+        return _VllmConvSilu.apply(acc).unsqueeze(0)
+    acc = torch.zeros(B, T, D, device=x.device, dtype=torch.float32)
+    for j in range(W):
+        xj = F.pad(x, (0, 0, W - 1 - j, 0))[:, :T]
+        acc = acc + (xj * weight[:, j]).float()
+    return _VllmConvSilu.apply(acc)
+
+
+# ------------------------------------------------------------------------------------
+
 
 class _ReplicatedParameterWithGradReduce(torch.autograd.Function):
     """Keep a replicated TP parameter in sync by reducing its gradient."""
@@ -532,6 +623,13 @@ class GatedDeltaNet(nn.Module):
         # ``conv_weight`` is the (headwise) per-rank slice; None means use the full module.
         weight = self.conv1d.weight if conv_weight is None else conv_weight
         groups = self.conv_dim_local // cp_div
+        if _HAS_TRITON and cp_context is None:
+            # 0-diff (qwen35-0diff-lite): the plain (non-CP) conv runs the vLLM
+            # contract replication — the fla kernel's fp32 products diverged by
+            # ~7e-5 absmean / 0.125 absmax from the rollout side on identical
+            # inputs.  Verified bitwise-identical to vLLM's Triton kernel on
+            # the C3 in-engine captures (4 layers x 336 tokens).
+            return _vllm_conv1d_silu(qkv, weight.squeeze(1), cu_seqlens)
         if _HAS_FLA and (cp_context is not None or cu_seqlens is not None or not self.deterministic):
             orig_seq_len = qkv.shape[1]
             # Chunkwise CP must not pad conv inputs: padding chunk-local causal-conv
