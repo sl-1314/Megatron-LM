@@ -177,6 +177,163 @@ def _vllm_conv1d_silu(
     return _VllmConvSilu.apply(acc)
 
 
+# 0-diff (qwen35-0diff-lite): vLLM fused_post_conv_prep gating contract ----------------
+#
+# vLLM computes the g/beta gating in fp32 inside the prep Triton kernel
+# (vllm/third_party/flash_linear_attention/ops/fused_gdn_prefill_post_conv.py):
+#   x  = fp32(a) + fp32(dt_bias)
+#   sp = where(x > 0, x + log(1+exp(-x)), log(1+exp(x)))   # branch softplus
+#   sp = where(x <= 20, sp, x)                             # threshold 20
+#   g  = -exp(fp32(A_log)) * sp                            # fp32 exp
+#   beta = sigmoid(fp32(b))
+# mlite's torch formula rounded exp(A_log) to bf16 when A_log is a bf16
+# parameter (100% of g elements off, up to 1e-1), used F.softplus's
+# log1p(exp(x)) (ulp-level), and torch sigmoid differs from tl.sigmoid by
+# 1 fp32 ulp on ~20% of beta values — so the forward must run in Triton.
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _vllm_g_beta_kernel(
+        a_ptr, b_ptr, alog_ptr, dtb_ptr, g_ptr, beta_ptr, n,
+        HV: tl.constexpr, BH: tl.constexpr, BLOCK: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        offs = pid * BLOCK + tl.arange(0, BLOCK)
+        mask = offs < n
+        o_h = tl.arange(0, BH)
+        mask_h = o_h < HV
+        m2 = mask[:, None] & mask_h[None, :]
+        a = tl.load(a_ptr + offs[:, None] * HV + o_h[None, :], mask=m2, other=0.0).to(tl.float32)
+        b = tl.load(b_ptr + offs[:, None] * HV + o_h[None, :], mask=m2, other=0.0).to(tl.float32)
+        A_log = tl.load(alog_ptr + o_h, mask=mask_h, other=0.0).to(tl.float32)
+        dtb = tl.load(dtb_ptr + o_h, mask=mask_h, other=0.0).to(tl.float32)
+        x = a + dtb[None, :]
+        sp = tl.where(x > 0, x + tl.log(1.0 + tl.exp(-x)), tl.log(1.0 + tl.exp(x)))
+        sp = tl.where(x <= 20.0, sp, x)
+        g = -tl.exp(A_log)[None, :] * sp
+        beta = tl.sigmoid(b)
+        tl.store(g_ptr + offs[:, None] * HV + o_h[None, :], g, mask=m2)
+        tl.store(beta_ptr + offs[:, None] * HV + o_h[None, :], beta, mask=m2)
+
+    class _VllmGBeta(torch.autograd.Function):
+        """Contract-exact g/beta gating (Triton forward, analytic fp32 backward)."""
+
+        @staticmethod
+        def forward(ctx, alpha, beta_in, A_log, dt_bias):
+            n, hv = alpha.shape
+            g = torch.empty(n, hv, device=alpha.device, dtype=torch.float32)
+            beta = torch.empty(n, hv, device=beta_in.device, dtype=torch.float32)
+            _vllm_g_beta_kernel[(triton.cdiv(n, 256),)](
+                alpha, beta_in, A_log, dt_bias, g, beta, n,
+                HV=hv, BH=triton.next_power_of_2(hv), BLOCK=256,
+            )
+            ctx.save_for_backward(g, beta, alpha, A_log, dt_bias)
+            return g, beta
+
+        @staticmethod
+        def backward(ctx, dg, dbeta):
+            g, beta, alpha, A_log, dt_bias = ctx.saved_tensors
+            # g = -exp(A_log) * softplus(x) with x = alpha + dt_bias
+            coef = -A_log.float().exp()
+            x = alpha.float() + dt_bias.float()
+            sig = torch.sigmoid(x)
+            grad_common = dg * (coef * sig)  # wrt both alpha and dt_bias
+            grad_beta = dbeta * beta * (1.0 - beta)
+            return (
+                grad_common.to(alpha.dtype),
+                grad_beta.to(alpha.dtype),
+                (dg * g).to(A_log.dtype),
+                grad_common.to(dt_bias.dtype),
+            )
+
+
+def _vllm_g_beta(alpha: torch.Tensor, beta: torch.Tensor, A_log: torch.Tensor, dt_bias: torch.Tensor):
+    """Bit-exact vLLM gating for contiguous ``[..., HV]`` alpha/beta inputs."""
+    shape = beta.shape
+    alpha2 = alpha.reshape(-1, shape[-1]).contiguous()
+    beta2 = beta.reshape(-1, shape[-1]).contiguous()
+    g, b = _VllmGBeta.apply(alpha2, beta2, A_log.contiguous(), dt_bias.contiguous())
+    return g.view(shape), b.view(shape)
+
+
+# 0-diff (qwen35-0diff-lite): vLLM RMSNormGated contract -------------------------------
+#
+# vLLM's gated output norm is the Triton layer_norm_fwd_kernel
+# (vllm/third_party/flash_linear_attention/ops/layernorm_guard.py, RMS mode,
+# norm_before_gate=True, silu) which stays in fp32 end to end and rounds to
+# bf16 ONCE:
+#   x fp32; var = sum(x*x)/N; rstd = rsqrt(var+eps)
+#   y = (x*rstd) * gamma;  y *= z * sigmoid(z);  store bf16
+# mlite's te.RMSNorm rounds its output to bf16 BEFORE the gate multiply
+# (double rounding), and TE's reduction/rsqrt differ from Triton by ulps —
+# together 26% of elements at up to 1.6e-2.  mlite stores the zero-centered
+# weight (gamma-1) for te.RMSNorm; fp32(w)+1 == gamma bitwise, so the kernel
+# adds 1 back in fp32.
+
+if _HAS_TRITON:
+
+    @triton.jit
+    def _vllm_gated_norm_kernel(
+        x_ptr, z_ptr, w_ptr, y_ptr, M, eps,
+        N: tl.constexpr, BN: tl.constexpr, BLOCK_M: tl.constexpr,
+    ):
+        pid = tl.program_id(0)
+        rows = pid * BLOCK_M + tl.arange(0, BLOCK_M)
+        cols = tl.arange(0, BN)
+        mask = (rows[:, None] < M) & (cols[None, :] < N)
+        offs = rows[:, None] * N + cols[None, :]
+        x = tl.load(x_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        z = tl.load(z_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+        w = tl.load(w_ptr + cols, mask=cols < N, other=0.0).to(tl.float32)
+        var = tl.sum(x * x, axis=1) / N
+        rstd = tl.rsqrt(var + eps)
+        y = x * rstd[:, None] * (w + 1.0)[None, :]
+        y = y * (z * tl.sigmoid(z))
+        tl.store(y_ptr + offs, y.to(tl.bfloat16, fp_downcast_rounding="rtne"), mask=mask)
+
+    class _VllmGatedNorm(torch.autograd.Function):
+        """Contract-exact gated RMSNorm (Triton forward, analytic fp32 backward)."""
+
+        @staticmethod
+        def forward(ctx, x, z, w, eps):
+            m, n = x.shape
+            y = torch.empty(m, n, device=x.device, dtype=torch.bfloat16)
+            _vllm_gated_norm_kernel[(triton.cdiv(m, 8),)](
+                x, z, w, y, m, eps, N=n, BN=triton.next_power_of_2(n), BLOCK_M=8
+            )
+            ctx.save_for_backward(x, z, w)
+            ctx.eps = eps
+            return y
+
+        @staticmethod
+        def backward(ctx, dy):
+            x, z, w = ctx.saved_tensors
+            n = x.shape[-1]
+            xf, zf = x.float(), z.float()
+            wf = w.float() + 1.0
+            dyf = dy.float()
+            var = (xf * xf).sum(-1, keepdim=True) / n
+            rstd = torch.rsqrt(var + ctx.eps)
+            sig = torch.sigmoid(zf)
+            s = zf * sig  # silu(z)
+            A = rstd * wf * s * dyf
+            t = (dyf * (xf * rstd * wf * s)).sum(-1, keepdim=True)
+            dx = A - (rstd * rstd * rstd) * (xf / n) * t
+            dz = dyf * (xf * rstd * wf) * (sig * (1.0 + zf * (1.0 - sig)))
+            dw = (dyf * (xf * rstd) * s).sum(0)
+            return dx.to(x.dtype), dz.to(x.dtype), dw.to(w.dtype), None
+
+
+def _vllm_gated_norm(x: torch.Tensor, gate: torch.Tensor, weight: torch.Tensor, eps: float):
+    """Bit-exact vLLM RMSNormGated(silu) for bf16 ``[..., N]`` x/gate inputs."""
+    shape = x.shape
+    n = shape[-1]
+    x2 = x.reshape(-1, n).contiguous()
+    g2 = gate.reshape(-1, n).contiguous()
+    return _VllmGatedNorm.apply(x2, g2, weight, eps).view(shape)
+
+
 # ------------------------------------------------------------------------------------
 
 
@@ -414,7 +571,18 @@ class GatedDeltaNet(nn.Module):
         )
         if self._replicate_heads:
             A_log, dt_bias = self._state_parameters_for_tp()
-        g, beta = self._compute_g_and_beta(A_log, dt_bias, alpha, beta)
+        # 0-diff (qwen35-0diff-lite): vLLM gating contract (fp32 branch softplus,
+        # fp32 exp(A_log), tl.sigmoid) — see _vllm_g_beta above.
+        if (
+            _HAS_TRITON
+            and alpha.is_contiguous()
+            and beta.is_contiguous()
+            and A_log.is_contiguous()
+            and dt_bias.is_contiguous()
+        ):
+            g, beta = _vllm_g_beta(alpha, beta, A_log, dt_bias)
+        else:
+            g, beta = self._compute_g_and_beta(A_log, dt_bias, alpha, beta)
         out, _ = self._gated_delta_rule(
             query,
             key,
@@ -427,7 +595,17 @@ class GatedDeltaNet(nn.Module):
             cp_context=cp_context,
         )
 
-        out = self._apply_gated_norm(out, gate)
+        # 0-diff (qwen35-0diff-lite): vLLM RMSNormGated contract (fp32 through
+        # the gate multiply, single bf16 rounding) — see _vllm_gated_norm above.
+        if (
+            _HAS_TRITON
+            and out.dtype == torch.bfloat16
+            and gate.dtype == torch.bfloat16
+            and out.shape[-1] == self.dv
+        ):
+            out = _vllm_gated_norm(out, gate, self.norm.weight, getattr(self.norm, "eps", 1e-6))
+        else:
+            out = self._apply_gated_norm(out, gate)
         out = out.reshape(
             batch,
             seq_len,
