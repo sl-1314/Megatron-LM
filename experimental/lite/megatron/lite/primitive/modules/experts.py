@@ -25,6 +25,131 @@ from megatron.lite.primitive.utils import ensure_divisible
 __all__ = ["Experts", "_AllReduceETP"]
 
 
+# 0-diff (qwen35-0diff-lite): vLLM Triton fused_moe contract for routed experts
+# --------------------------------------------------------------------------------
+#
+# The rollout side (vLLM, TRITON unquantized MoE backend) computes the routed
+# experts as: moe_align_block_size -> Triton GEMM1 (w13) -> silu_and_mul ->
+# Triton GEMM2 (w2, router weights applied in-kernel) -> moe_sum over the k
+# slots.  Driving vLLM's own ``fused_experts`` entry point with the mlite
+# expert weights (stacked [E, 2N, K] / [E, K, N], identical layout) and the
+# bit-exact router outputs reproduces the engine's routed output bitwise
+# (verified 0 mismatch x 4 layers on the C3 in-engine captures).  Importing
+# the vLLM function keeps the Triton binaries identical to the engine's —
+# no transcription risk.
+#
+# ``fused_experts`` is inference-only, so gradients go through a
+# mathematically-exact torch recompute (not bitwise; vLLM defines no backward
+# reference at all) under :class:`_VllmFusedMoe`.
+#
+# Validity window: bf16, TP=EP=ETP=1, unquantized.  Other configurations fall
+# back to the TE grouped-GEMM path.
+
+_VLLM_FUSED_MOE_IMPORT_ERROR: str | None = ""
+
+
+def _vllm_fused_experts_fn():
+    """Lazily import vLLM's fused_experts; None when unavailable."""
+    global _VLLM_FUSED_MOE_IMPORT_ERROR
+    if _VLLM_FUSED_MOE_IMPORT_ERROR != "":
+        return None
+    try:
+        from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
+
+        return fused_experts
+    except Exception as e:  # pragma: no cover - env-dependent
+        _VLLM_FUSED_MOE_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+        return None
+
+
+def stack_expert_weights(grouped: "te.GroupedLinear") -> torch.Tensor:
+    """Stack the per-expert ``weight{i}`` params into ``[E, out, in]``."""
+    num_experts = getattr(grouped, "num_gemms")
+    return torch.stack([getattr(grouped, f"weight{i}") for i in range(num_experts)])
+
+
+def _torch_grouped_moe(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    weights: torch.Tensor,
+    ids: torch.Tensor,
+) -> torch.Tensor:
+    """Differentiable torch recompute of the fused_experts math.
+
+    Used only by the backward: segments the (token, slot) rows by expert and
+    runs one small matmul per expert; gradients flow through plain torch ops.
+    """
+    num_tokens, hidden = x.shape
+    k = ids.shape[1]
+    num_experts = w13.shape[0]
+    flat_ids = ids.view(-1).long()
+    xs = x.repeat_interleave(k, dim=0)
+    order = torch.argsort(flat_ids, stable=True)
+    sorted_ids = flat_ids[order]
+    xs_s = xs[order]
+    wts_s = weights.view(-1).float()[order]
+    counts = torch.bincount(sorted_ids, minlength=num_experts)
+    ends = torch.cumsum(counts, 0)
+    out_sorted = torch.zeros(
+        num_tokens * k, hidden, dtype=torch.float32, device=x.device
+    )
+    for e in range(num_experts):
+        end = int(ends[e])
+        beg = int(ends[e - 1]) if e else 0
+        if beg == end:
+            continue
+        c1 = xs_s[beg:end] @ w13[e]
+        gate, up = c1.chunk(2, dim=-1)
+        c2 = torch.nn.functional.silu(gate) * up
+        c3 = c2 @ w2[e].t()
+        out_sorted[beg:end] = c3.float() * wts_s[beg:end, None]
+    out_orig = torch.zeros_like(out_sorted)
+    out_orig[order] = out_sorted
+    return (out_orig.view(num_tokens, k, hidden).sum(1)).to(x.dtype)
+
+
+class _VllmFusedMoe(torch.autograd.Function):
+    """Routed experts: bitwise vLLM forward (fused_experts), exact torch backward."""
+
+    @staticmethod
+    def forward(ctx, x, w13, w2, weights, ids):
+        fused_experts = _vllm_fused_experts_fn()
+        assert fused_experts is not None
+        out = fused_experts(
+            x,
+            w13,
+            w2,
+            weights.to(torch.float32).contiguous(),
+            ids.to(torch.int32).contiguous(),
+        )
+        ctx.save_for_backward(x, w13, w2, weights, ids)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, w13, w2, weights, ids = ctx.saved_tensors
+        with torch.enable_grad():
+            x_ = x.detach().requires_grad_(True)
+            w13_ = w13.detach().requires_grad_(True)
+            w2_ = w2.detach().requires_grad_(True)
+            wts_ = weights.detach().float().requires_grad_(True)
+            out_ = _torch_grouped_moe(x_, w13_, w2_, wts_, ids)
+            grads = torch.autograd.grad(out_, (x_, w13_, w2_, wts_), dout)
+        return grads[0], grads[1], grads[2], grads[3].to(weights.dtype), None
+
+
+def vllm_fused_moe(
+    x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
+) -> torch.Tensor:
+    """Bit-exact vLLM Triton fused_moe for bf16 [T, K] inputs."""
+    return _VllmFusedMoe.apply(x, w13, w2, weights, ids)
+
+
+def vllm_fused_moe_available() -> bool:
+    return _vllm_fused_experts_fn() is not None
+
+
 @contextmanager
 def _expert_nvtx_range(name: str):
     if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():

@@ -76,6 +76,21 @@ def _swiglu(x: torch.Tensor) -> torch.Tensor:
     return swiglu_with_probs(x, probs=None)
 
 
+def _vllm_swiglu(x: torch.Tensor) -> torch.Tensor:
+    """0-diff: vLLM silu_and_mul contract for bf16 ``[..., 2d]`` inputs.
+
+    vLLM's act_and_mul kernel (csrc/activation_kernels.cu) computes silu in
+    fp32, ROUNDS TO bf16 (packed_silu_kernel's cast_to_packed), then
+    multiplies by the up half in fp32 and rounds once more — the same
+    double-rounding structure as plain torch ``F.silu(gate) * up``, verified
+    bitwise against the in-engine capture (0 mismatch on engine + 2.6M random
+    bf16 elements).  The TE bias_swiglu kernel single-rounds and differs
+    (~27% of elements, up to 1.6e-2).
+    """
+    gate, up = x.chunk(2, dim=-1)
+    return torch.nn.functional.silu(gate) * up
+
+
 def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
     section = getattr(config, "mrope_section", None)
     if section is not None:
@@ -172,7 +187,13 @@ class SharedExpert(nn.Module):
         if self.use_mcore_overlap_graph:
             fc1_input = self._CopyToTPRegion.apply(x, self.tp_group)
             self._set_grad_fn_sequence_sr(fc1_input)
-        output = self.down(_swiglu(self.gate_up(fc1_input)))
+        # 0-diff: vLLM silu_and_mul contract (see _vllm_swiglu).
+        act = (
+            _vllm_swiglu(self.gate_up(fc1_input))
+            if fc1_input.dtype == torch.bfloat16
+            else _swiglu(self.gate_up(fc1_input))
+        )
+        output = self.down(act)
         if self.use_mcore_overlap_graph:
             self._set_grad_fn_sequence_sr(output)
         return output * gate_val
@@ -193,6 +214,7 @@ class MoELayer(nn.Module):
         shared_expert_plain_te: bool = False,
         moe_permute_fusion: bool | None = None,
         vllm_topk_contract: bool = False,
+        vllm_fused_moe_contract: bool = False,
     ):
         super().__init__()
         if fp8:
@@ -206,6 +228,14 @@ class MoELayer(nn.Module):
             vllm_topk_contract=vllm_topk_contract,
         )
         self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        self.vllm_fused_moe_contract = bool(
+            vllm_fused_moe_contract
+            and vllm_topk_contract
+            and ps.tp_size == 1
+            and ps.ep_size == 1
+            and ps.etp_size == 1
+            and not fp8
+        )
         self.dispatcher = TokenDispatcher(
             config.num_experts,
             config.hidden_size,
@@ -230,16 +260,37 @@ class MoELayer(nn.Module):
             with torch.cuda.stream(side_stream):
                 shared_out = self.shared_expert(shared_input)
         scores, indices = self.router(router_input)
-        dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
-        del scores, indices
-        self.dispatcher.wait_dispatch_event()
-        expert_out = self.experts(
-            dispatched,
-            tpe,
-            permuted_probs,
-            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
-        )
-        routed_out = self.dispatcher.combine(expert_out)
+        if self.vllm_fused_moe_contract and x_2d.dtype == torch.bfloat16:
+            # 0-diff: drive vLLM's Triton fused_moe (same binaries the
+            # rollout engine runs) on the stacked expert weights — bitwise
+            # routed output; see experts.vllm_fused_moe.
+            from megatron.lite.primitive.modules.experts import (
+                stack_expert_weights,
+                vllm_fused_moe,
+                vllm_fused_moe_available,
+            )
+
+            if vllm_fused_moe_available():
+                w13 = stack_expert_weights(self.experts.fc1)
+                w2 = stack_expert_weights(self.experts.fc2)
+                routed_out = vllm_fused_moe(x_2d.contiguous(), w13, w2, scores, indices)
+                routed_out = routed_out.view(input_shape)
+                scores = indices = None
+            else:  # pragma: no cover - vllm missing in env
+                routed_out = None
+        else:
+            routed_out = None
+        if routed_out is None:
+            dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
+            del scores, indices
+            self.dispatcher.wait_dispatch_event()
+            expert_out = self.experts(
+                dispatched,
+                tpe,
+                permuted_probs,
+                tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+            )
+            routed_out = self.dispatcher.combine(expert_out)
 
         if shared_out is None:
             shared_out = self.shared_expert(shared_input)
@@ -323,6 +374,10 @@ class Qwen35Layer(nn.Module):
                 # side does (plain bf16 gate GEMM + vLLM topkGating weights);
                 # the fp32 TE gate mis-routed 10-14% of tokens per layer.
                 vllm_topk_contract=True,
+                # 0-diff: routed experts through vLLM's Triton fused_moe
+                # (bitwise vs the rollout engine; TE grouped-GEMM path stays
+                # the fallback for TP/EP or non-bf16 configs).
+                vllm_fused_moe_contract=True,
             )
             self.mlp: DenseMLP | None = None
         else:
