@@ -188,6 +188,7 @@ class MoELayer(nn.Module):
         preserve_3d_graph: bool = False,
         shared_expert_plain_te: bool = False,
         moe_permute_fusion: bool | None = None,
+        vllm_topk_contract: bool = False,
     ):
         super().__init__()
         if fp8:
@@ -198,6 +199,7 @@ class MoELayer(nn.Module):
             router_bias_rate=router_bias_rate,
             compute_aux_loss=True,
             router_dtype=router_dtype,
+            vllm_topk_contract=vllm_topk_contract,
         )
         self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
         self.dispatcher = TokenDispatcher(
@@ -311,6 +313,10 @@ class Qwen35Layer(nn.Module):
                 preserve_3d_graph=deterministic,
                 shared_expert_plain_te=deterministic,
                 moe_permute_fusion=True,
+                # 0-diff (qwen35-0diff-lite): route bit-exactly as the rollout
+                # side does (plain bf16 gate GEMM + vLLM topkGating weights);
+                # the fp32 TE gate mis-routed 10-14% of tokens per layer.
+                vllm_topk_contract=True,
             )
             self.mlp: DenseMLP | None = None
         else:

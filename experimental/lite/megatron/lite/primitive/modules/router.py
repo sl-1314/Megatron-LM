@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
+import torch.nn.functional as F  # pyright: ignore[reportMissingImports]
 
 from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
 from megatron.lite.primitive.modules.router_replay import (
@@ -42,6 +43,61 @@ def _ordered_topk_from_routing_map(
     return topk_scores, topk_indices
 
 
+def _vllm_topk_softmax_contract(
+    logits: torch.Tensor, topk: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Bit-exact torch replication of vLLM's ``topkGating`` CUDA kernel.
+
+    0-diff (qwen35-0diff-lite): the rollout-side contract owner is vLLM's
+    ``ops.topk_softmax`` (csrc/moe/topk_softmax_kernels.cu, softmax scoring,
+    renormalize, no bias, routed_scaling_factor=1.0).  For E=256 bf16 gating
+    the kernel layout is VPT=8 / THREADS_PER_ROW=32: each of the 32 lanes sums
+    its 8 contiguous experts sequentially (left-to-right), the row total Z is
+    an XOR butterfly over the lanes (masks 16..1), probabilities are
+    ``exp(l - max) * (1/Z)``, and the final weights are the top-k probabilities
+    renormalized by a sequential accumulation over the k-loop order.
+
+    Selection runs on the raw bf16 logits (``torch.topk`` sorted descending):
+    softmax is monotone, so the set agrees with the kernel's top-k on the
+    probabilities; the kernel's equal-probability tie-break (lower expert id
+    wins) empirically matches torch.topk's tie behavior on bf16 logits
+    (verified set-exact on the C3 in-engine captures, 4 layers x 336 tokens).
+
+    Caveat: ``torch.exp`` on fp32 CUDA is bit-identical to the kernel's
+    ``expf`` and plain elementwise add/mul/div round identically, but any
+    change of GPU architecture or torch build invalidates the bitwise
+    property — re-verify against an in-engine capture before relying on it.
+    """
+    num_tokens, num_experts = logits.shape
+    if num_experts != 256 or logits.dtype != torch.bfloat16:
+        raise NotImplementedError(
+            "vllm_topk_softmax_contract replication covers the Qwen3.5 MoE shape "
+            f"(E=256 bf16); got E={num_experts} {logits.dtype}"
+        )
+    lf = logits.float()
+    row_max = lf.max(dim=-1, keepdim=True).values
+    e = torch.exp(lf - row_max)
+
+    # Z: per-lane sequential sum of 8 contiguous experts, then XOR butterfly.
+    e8 = e.view(num_tokens, 32, 8)
+    s = e8[..., :1].clone()
+    for i in range(1, 8):
+        s = s + e8[..., i : i + 1]
+    lane_idx = torch.arange(32, device=logits.device)
+    for mask in (16, 8, 4, 2, 1):
+        s = s + s[:, lane_idx ^ mask]
+    z = s[:, :1, :].view(num_tokens, 1)
+
+    p = e * (1.0 / z)
+    _, topk_indices = torch.topk(logits, k=topk, dim=1, sorted=True)
+    p_sel = torch.gather(p, 1, topk_indices)
+    sel_sum = p_sel[..., :1].clone()
+    for i in range(1, topk):
+        sel_sum = sel_sum + p_sel[..., i : i + 1]
+    weights = p_sel * (1.0 / sel_sum)
+    return weights, topk_indices
+
+
 def _reject_aux_loss_during_replay(router_replay: RouterReplay | None) -> None:
     if (
         router_replay is not None
@@ -68,6 +124,7 @@ class TopKRouter(nn.Module):
         use_pre_softmax: bool = False,
         moe_router_fusion: bool = False,
         router_dtype: torch.dtype | None = None,
+        vllm_topk_contract: bool = False,
     ):
         super().__init__()
         if router_bias_rate > 0:
@@ -83,6 +140,7 @@ class TopKRouter(nn.Module):
         self.use_pre_softmax = use_pre_softmax
         self.moe_router_fusion = moe_router_fusion
         self.router_dtype = router_dtype
+        self.vllm_topk_contract = vllm_topk_contract
         self.router_replay: RouterReplay | None = None
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
@@ -94,29 +152,41 @@ class TopKRouter(nn.Module):
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         router_dtype = self.router_dtype or x.dtype
-        logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
-        logits = logits.view(-1, self.num_experts)
-        num_tokens = logits.size(0)
-        if self.moe_router_fusion:
-            probs_dense, _ = topk_routing_with_score_function(
-                logits,
-                self.topk,
-                use_pre_softmax=self.use_pre_softmax,
-                score_function="softmax",
-                fused=True,
-            )
-            topk_scores, topk_indices = torch.topk(probs_dense, k=self.topk, dim=-1)
+        if self.vllm_topk_contract:
+            # 0-diff (qwen35-0diff-lite): route on the plain bf16 gate GEMM and
+            # reproduce vLLM's topkGating weights bit-exactly.  The plain
+            # F.linear output is bitwise-identical to vLLM's router logits
+            # (verified on the C3 in-engine captures); the TE fp32 gate would
+            # rank experts before the bf16 rounding and mis-rout 10-14% of
+            # tokens relative to the rollout contract.
+            logits = F.linear(x, self.gate.weight)
+            logits = logits.view(-1, self.num_experts)
+            topk_scores, topk_indices = _vllm_topk_softmax_contract(logits, self.topk)
+            num_tokens = logits.size(0)
         else:
-            probs_dense, routing_map = topk_routing_with_score_function(
-                logits,
-                self.topk,
-                use_pre_softmax=self.use_pre_softmax,
-                score_function="softmax",
-                fused=False,
-            )
-            topk_scores, topk_indices = _ordered_topk_from_routing_map(
-                probs_dense, routing_map, self.topk
-            )
+            logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
+            logits = logits.view(-1, self.num_experts)
+            num_tokens = logits.size(0)
+            if self.moe_router_fusion:
+                probs_dense, _ = topk_routing_with_score_function(
+                    logits,
+                    self.topk,
+                    use_pre_softmax=self.use_pre_softmax,
+                    score_function="softmax",
+                    fused=True,
+                )
+                topk_scores, topk_indices = torch.topk(probs_dense, k=self.topk, dim=-1)
+            else:
+                probs_dense, routing_map = topk_routing_with_score_function(
+                    logits,
+                    self.topk,
+                    use_pre_softmax=self.use_pre_softmax,
+                    score_function="softmax",
+                    fused=False,
+                )
+                topk_scores, topk_indices = _ordered_topk_from_routing_map(
+                    probs_dense, routing_map, self.topk
+                )
         if self.router_replay is not None:
             selected_indices = self.router_replay.select_indices(topk_indices)
             if selected_indices is not topk_indices:
