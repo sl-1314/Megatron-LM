@@ -150,6 +150,122 @@ def vllm_fused_moe_available() -> bool:
     return _vllm_fused_experts_fn() is not None
 
 
+# 0-diff (qwen35-0diff-epcp): EP>1 fused-MoE contract --------------------------
+#
+# At EP>1 every rank sees the full (replicated) token stream and routing and
+# owns a contiguous expert shard [ep_rank*n_local, (ep_rank+1)*n_local) (the
+# checkpoint loader's placement).  Each rank drives vLLM's fused_experts on ITS
+# shard with the non-local slots remapped to local expert 0 with weight 0
+# (those rows come out exactly zero); the per-slot PRE-SUM intermediate (the
+# ops.moe_sum input, [t, k, h]) is all-reduced — every element is non-zero on
+# exactly one rank and IEEE x+0 is exact, so the combine is bitwise — and the
+# final topk-slot-order sum runs locally through the same vLLM moe_sum kernel
+# the EP1 contract uses.  Per-slot bitwise equivalence of the sharded call vs
+# the full-experts call (Triton config/tiling invariance) is empirically
+# verified: outputs/.../c10mesh/cache3_probe.json (C10_CACHE3_PASS).
+#
+# The pre-sum intermediate is obtained by capturing the ops.moe_sum input
+# around the fused_experts call (the same public entry point as EP1 — no
+# transcription).  Backward mirrors _VllmFusedMoe: a masked
+# _torch_grouped_moe surrogate per rank; x / routing-weight grads are
+# per-shard contributions and are all-reduced (summed) across EP, expert grads
+# stay local (FSDP owns the shard params).
+
+_moe_sum_orig = None
+_moe_sum_captured: list[torch.Tensor] = []
+
+
+@contextmanager
+def _capture_pre_moe_sum():
+    """Capture fused_experts' pre-sum intermediate (the ops.moe_sum input).
+
+    The stub skips vLLM's in-call moe_sum (its summed result is discarded —
+    the contract runs the real kernel itself, after the EP combine).
+    """
+    global _moe_sum_orig
+    import vllm._custom_ops as vops
+
+    if _moe_sum_orig is None:
+        _moe_sum_orig = vops.moe_sum
+    del _moe_sum_captured[:]
+
+    def _stub(inp, out):
+        _moe_sum_captured.append(inp.detach().clone())
+
+    vops.moe_sum = _stub
+    try:
+        yield _moe_sum_captured
+    finally:
+        vops.moe_sum = _moe_sum_orig
+
+
+def _vllm_moe_sum(inp: torch.Tensor, out: torch.Tensor) -> None:
+    import vllm._custom_ops as vops
+
+    vops.moe_sum(inp, out)
+
+
+class _VllmFusedMoeEP(torch.autograd.Function):
+    """Routed experts at EP>1: bitwise vLLM forward, exact torch backward."""
+
+    @staticmethod
+    def forward(ctx, x, w13, w2, weights, ids, ep_group, ep_rank, n_local):
+        fused_experts = _vllm_fused_experts_fn()
+        assert fused_experts is not None
+        mask = (ids // n_local) == ep_rank
+        ids_r = torch.where(mask, ids - ep_rank * n_local, torch.zeros_like(ids))
+        w_r = weights.to(torch.float32) * mask.to(torch.float32)
+        with _capture_pre_moe_sum() as captured:
+            fused_experts(x, w13, w2, w_r.contiguous(),
+                          ids_r.to(torch.int32).contiguous())
+        cache3 = captured[0]
+        # EP combine: exactly one rank contributes a non-zero per-slot value.
+        dist.all_reduce(cache3, group=ep_group)
+        out = torch.empty(x.shape, dtype=x.dtype, device=x.device)
+        _vllm_moe_sum(cache3.contiguous(), out)
+        ctx.save_for_backward(x, w13, w2, weights, ids)
+        ctx.ep_group = ep_group
+        ctx.ep_rank = ep_rank
+        ctx.n_local = n_local
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, w13, w2, weights, ids = ctx.saved_tensors
+        mask = (ids // ctx.n_local) == ctx.ep_rank
+        ids_r = torch.where(mask, ids - ctx.ep_rank * ctx.n_local,
+                            torch.zeros_like(ids))
+        with torch.enable_grad():
+            x_ = x.detach().requires_grad_(True)
+            w13_ = w13.detach().requires_grad_(True)
+            w2_ = w2.detach().requires_grad_(True)
+            wts_ = (weights.detach().float() * mask.to(torch.float32)).requires_grad_(True)
+            out_ = _torch_grouped_moe(x_, w13_, w2_, wts_, ids_r)
+            grads = torch.autograd.grad(out_, (x_, w13_, w2_, wts_), dout)
+        # x / routing-weight grads are this shard's contribution only: sum
+        # them across EP (the surrounding network is replicated, so dout —
+        # and every other gradient path — is identical on all ranks).
+        gx = grads[0].contiguous()
+        gw = grads[3].contiguous()
+        dist.all_reduce(gx, group=ctx.ep_group)
+        dist.all_reduce(gw, group=ctx.ep_group)
+        return gx, grads[1], grads[2], gw.to(weights.dtype), None, None, None, None
+
+
+def vllm_fused_moe_ep(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    weights: torch.Tensor,
+    ids: torch.Tensor,
+    ep_group,
+    ep_rank: int,
+    n_local: int,
+) -> torch.Tensor:
+    """Bit-exact vLLM Triton fused_moe for bf16 [T, K] inputs at EP>1."""
+    return _VllmFusedMoeEP.apply(x, w13, w2, weights, ids, ep_group, ep_rank, n_local)
+
+
 @contextmanager
 def _expert_nvtx_range(name: str):
     if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():

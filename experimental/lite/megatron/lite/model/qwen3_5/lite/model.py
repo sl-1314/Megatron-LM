@@ -237,11 +237,14 @@ class MoELayer(nn.Module):
             vllm_topk_contract=vllm_topk_contract,
         )
         self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        # 0-diff (qwen35-0diff-epcp): EP>1 is served by the per-shard
+        # vllm_fused_moe_ep contract (bitwise via pre-sum all-reduce + local
+        # slot-order moe_sum), so the contract no longer requires ep_size==1.
+        self.ps = ps
         self.vllm_fused_moe_contract = bool(
             vllm_fused_moe_contract
             and vllm_topk_contract
             and ps.tp_size == 1
-            and ps.ep_size == 1
             and ps.etp_size == 1
             and not fp8
         )
@@ -277,12 +280,21 @@ class MoELayer(nn.Module):
                 stack_expert_weights,
                 vllm_fused_moe,
                 vllm_fused_moe_available,
+                vllm_fused_moe_ep,
             )
 
             if vllm_fused_moe_available():
                 w13 = stack_expert_weights(self.experts.fc1)
                 w2 = stack_expert_weights(self.experts.fc2)
-                routed_out = vllm_fused_moe(x_2d.contiguous(), w13, w2, scores, indices)
+                if self.ps.ep_size > 1:
+                    routed_out = vllm_fused_moe_ep(
+                        x_2d.contiguous(), w13, w2, scores, indices,
+                        self.ps.ep_group, self.ps.ep_rank,
+                        self.experts.num_local_experts,
+                    )
+                else:
+                    routed_out = vllm_fused_moe(
+                        x_2d.contiguous(), w13, w2, scores, indices)
                 routed_out = routed_out.view(input_shape)
                 scores = indices = None
             else:  # pragma: no cover - vllm missing in env
