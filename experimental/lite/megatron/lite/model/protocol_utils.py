@@ -106,6 +106,14 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
             packed.cu_seqlens_padded, max_seqlen=max_seqlen
         ),
     }
+    # 0-diff (qwen35-0diff-epcp): tight (true-length) global cu for the CP
+    # full-stream contracts; the padded cu alone cannot recover real rows.
+    psp = kwargs["packed_seq_params"]
+    cu_real = torch.zeros_like(packed.cu_seqlens_padded)
+    cu_real[1:] = torch.cumsum(
+        seq_lens.to(packed.cu_seqlens_padded.dtype), dim=0
+    )
+    psp.cu_seqlens_q_real = cu_real
     prepare_packed_thd_kwargs_for_context_parallel(model, kwargs)
     return kwargs
 

@@ -19,6 +19,10 @@ class PackedSeqParams:
     cu_seqlens_kv: Tensor | None = None
     cu_seqlens_q_padded: Tensor | None = None
     cu_seqlens_kv_padded: Tensor | None = None
+    # 0-diff (qwen35-0diff-epcp): TIGHT (true-length) global cu for the CP
+    # full-stream contracts — the padded cu alone cannot recover the real
+    # rows.  Attached by the pack/protocol layer; None = no CP contract.
+    cu_seqlens_q_real: Tensor | None = None
     max_seqlen_q: int | None = None
     max_seqlen_kv: int | None = None
     local_cp_size: int | None = None

@@ -325,6 +325,162 @@ class MoELayer(nn.Module):
         return output.to(x.dtype)
 
 
+# 0-diff (qwen35-0diff-epcp): CP full-stream contracts on the TIGHT stream -----
+#
+# The vLLM FA contract (gqa._vllm_fa_contract_forward) has no CP awareness:
+# feeding it a zigzag shard as complete sequences corrupts the FA3 varlen call
+# (NaN / illegal memory access — C10 mesh probe).  And the CP pack layout pads
+# every sequence to a multiple of 2*cp, which the CP-off (TP1, engine-bitwise)
+# path never does — running contract GEMMs on either the local shard
+# (M = T/4) or the padded full stream (M = T + pad) selects different cuBLAS
+# kernels than M = T and corrupts individual rows at 1 ulp (measured on the
+# shared expert's plain GEMMs, incl. the N=1 shared gate; see
+# c10mesh/DESIGN.md).  The bitwise CP contract therefore gathers the zigzag
+# parts, strips the pad rows, and runs the contract body on the TIGHT full
+# stream — byte-identical to the CP-off input (same M, same cu, same code
+# path), so the layer output is bitwise by construction — then scatters the
+# outputs back into this rank's local shard (pad rows zero).
+#
+# Applied to EVERY contract layer (GDN and FA alike): the whole layer body
+# (attention + projections + MoE) runs on the gathered tight stream — the
+# GDN in/out projections are plain GEMMs too and hit the same M-dependence
+# (the headwise CP path was bitwise on the 31-seq group by luck: M=2520 vs
+# 9989 picked the same cuBLAS kernels; the single-seq group, M=84 vs 336,
+# did not).  The in-process GDN CP view (headwise all-to-all) is bypassed
+# inside the wrapper via ``disable_cp``.  At EP>1 the gathered stream is
+# also exactly what vllm_fused_moe_ep needs.
+#
+# Cost: contract layers run redundantly on every CP rank (~cp x FLOPs);
+# recorded as perf debt.
+#
+# Backward: the scatter's backward all-reduces the per-rank output grads
+# into the total full-stream grad (each rank owns a disjoint row set), and
+# the gather's backward then just splits the total onto the local shard —
+# no second all-reduce (the body ran redundantly, so every rank already
+# holds the total; summing again would count it cp times).
+
+
+def _thd_token_dim(t: torch.Tensor) -> int:
+    """Token dim of a THD stream tensor: (1,T,H)/(T,1,H) → 1/0, MRoPE (3,1,T) → 2."""
+    if t.dim() == 3 and t.shape[0] == 3:
+        return 2
+    if t.dim() == 3:
+        return 1 if t.shape[0] == 1 else 0
+    if t.dim() == 2:
+        return 0
+    raise ValueError(f"not a THD stream shape: {tuple(t.shape)}")
+
+
+_TIGHT_ROW_CACHE: dict = {}
+
+
+def _tight_real_rows(cu_pad: torch.Tensor, cu_real: torch.Tensor) -> torch.Tensor:
+    """Index of real (non-pad) rows in the padded stream, cached per layout."""
+    key = (tuple(cu_pad.tolist()), tuple(cu_real.tolist()))
+    idx = _TIGHT_ROW_CACHE.get(key)
+    if idx is None:
+        rows = []
+        for a, r0, r1 in zip(
+            cu_pad[:-1].tolist(), cu_real[:-1].tolist(), cu_real[1:].tolist()
+        ):
+            rows.append(torch.arange(a, a + (r1 - r0), device=cu_pad.device))
+        idx = torch.cat(rows)
+        _TIGHT_ROW_CACHE[key] = idx
+    return idx
+
+
+def _tight_max_seqlen(cu_real: torch.Tensor) -> int:
+    lens = (cu_real[1:] - cu_real[:-1])
+    return int(lens.max().item()) if lens.numel() else 0
+
+
+class _CPGatherTightStream(torch.autograd.Function):
+    """All-gather zigzag parts, reconstruct the padded full stream, strip pads."""
+
+    @staticmethod
+    def forward(ctx, t, dim, cu_pad, cu_real, cp_size, cp_rank, cp_group):
+        from megatron.lite.primitive.parallel.thd import (
+            _all_gather_cp_tensor,
+            reconstruct_packed_from_cp_parts,
+        )
+
+        parts = _all_gather_cp_tensor(t, cp_size=cp_size, cp_group=cp_group)
+        full_pad = reconstruct_packed_from_cp_parts(
+            parts, cu_seqlens_padded=cu_pad, cp_size=cp_size, dim=dim
+        )
+        tight = full_pad.index_select(dim, _tight_real_rows(cu_pad, cu_real))
+        ctx.meta = (dim, cu_pad, cu_real, cp_size, cp_rank, cp_group)
+        return tight
+
+    @staticmethod
+    def backward(ctx, grad_tight):
+        from megatron.lite.primitive.parallel.thd import split_packed_to_cp_local
+
+        dim, cu_pad, cu_real, cp_size, cp_rank, cp_group = ctx.meta
+        shape = list(grad_tight.shape)
+        shape[dim] = int(cu_pad[-1].item())
+        grad_pad = torch.zeros(
+            shape, dtype=grad_tight.dtype, device=grad_tight.device
+        )
+        grad_pad.index_copy_(dim, _tight_real_rows(cu_pad, cu_real), grad_tight)
+        # grad_tight is already the total (the scatter backward all-reduced
+        # it and the body ran identically on every rank): only split.
+        grad_local = split_packed_to_cp_local(
+            grad_pad, cu_seqlens_padded=cu_pad, cp_size=cp_size,
+            cp_rank=cp_rank, dim=dim,
+        )
+        return grad_local, None, None, None, None, None, None
+
+
+class _CPScatterTightToLocal(torch.autograd.Function):
+    """Scatter tight full-stream values into this rank's local shard (pads 0)."""
+
+    @staticmethod
+    def forward(ctx, t_tight, dim, cu_pad, cu_real, cp_size, cp_rank, cp_group):
+        from megatron.lite.primitive.parallel.thd import split_packed_to_cp_local
+
+        shape = list(t_tight.shape)
+        shape[dim] = int(cu_pad[-1].item())
+        full_pad = torch.zeros(
+            shape, dtype=t_tight.dtype, device=t_tight.device
+        )
+        full_pad.index_copy_(dim, _tight_real_rows(cu_pad, cu_real), t_tight)
+        ctx.meta = (dim, cu_pad, cu_real, cp_size, cp_rank, cp_group)
+        return split_packed_to_cp_local(
+            full_pad, cu_seqlens_padded=cu_pad, cp_size=cp_size,
+            cp_rank=cp_rank, dim=dim,
+        )
+
+    @staticmethod
+    def backward(ctx, grad_local):
+        from megatron.lite.primitive.parallel.thd import (
+            reconstruct_packed_from_cp_parts,
+        )
+
+        dim, cu_pad, cu_real, cp_size, cp_rank, cp_group = ctx.meta
+        parts = [torch.zeros_like(grad_local) for _ in range(cp_size)]
+        parts[cp_rank] = grad_local
+        grad_pad = reconstruct_packed_from_cp_parts(
+            parts, cu_seqlens_padded=cu_pad, cp_size=cp_size, dim=dim
+        )
+        # Sum the disjoint per-rank contributions into the total tight grad.
+        grad_tight = grad_pad.index_select(dim, _tight_real_rows(cu_pad, cu_real))
+        dist.all_reduce(grad_tight, group=cp_group)
+        return grad_tight, None, None, None, None, None, None
+
+
+def _cp_tight_meta(packed_seq_params):
+    """(cu_pad, cu_real) for the CP contracts; raises when tight cu is absent."""
+    cu_pad = packed_seq_params.cu_seqlens_q
+    cu_real = getattr(packed_seq_params, "cu_seqlens_q_real", None)
+    if cu_real is None:
+        raise RuntimeError(
+            "CP full-stream contract requires PackedSeqParams.cu_seqlens_q_real "
+            "(attached by pack_thd_forward_kwargs)."
+        )
+    return cu_pad, cu_real
+
+
 class Qwen35Layer(nn.Module):
     def __init__(
         self,
@@ -413,12 +569,56 @@ class Qwen35Layer(nn.Module):
             self.moe = None
             self.mlp = DenseMLP(config, ps)
 
+    def _contract_cp_full_stream(
+        self, x, position_ids, packed_seq_params, residual
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """CP wrapper: gather the TIGHT full stream, run the contract layer, scatter.
+
+        The CP-packed psp keeps the GLOBAL padded cu_seqlens (only the
+        local_cp_size/cp_rank/cp_group metadata is attached; the stream
+        tensors are pre-split to the local zigzag shard).  The contract body
+        must instead see the CP-off input exactly: the tight (true-length)
+        full stream with a fresh plain psp — see the _CPGatherTightStream
+        block above for why anything else breaks per-row bitwise.
+        """
+        from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+        ps = self.ps
+        cp = ps.cp_size
+        cu_pad, cu_real = _cp_tight_meta(packed_seq_params)
+        gather = _CPGatherTightStream.apply
+        xg = gather(x, _thd_token_dim(x), cu_pad, cu_real, cp,
+                    ps.cp_rank, ps.cp_group)
+        if residual is not None:
+            residual = gather(residual, _thd_token_dim(residual),
+                              cu_pad, cu_real, cp, ps.cp_rank, ps.cp_group)
+        if position_ids is not None:
+            position_ids = gather(
+                position_ids, _thd_token_dim(position_ids),
+                cu_pad, cu_real, cp, ps.cp_rank, ps.cp_group)
+        psp_full = PackedSeqParams.from_cu_seqlens(
+            cu_real, max_seqlen=_tight_max_seqlen(cu_real)
+        )
+        h, res_out = Qwen35Layer.forward(
+            self, xg, position_ids=position_ids,
+            packed_seq_params=psp_full, residual=residual,
+            _cp_full_stream=True,
+        )
+        scatter = _CPScatterTightToLocal.apply
+        h = scatter(h, _thd_token_dim(h), cu_pad, cu_real, cp,
+                    ps.cp_rank, ps.cp_group)
+        if res_out is not None:
+            res_out = scatter(res_out, _thd_token_dim(res_out),
+                              cu_pad, cu_real, cp, ps.cp_rank, ps.cp_group)
+        return h, res_out
+
     def forward(
         self,
         x: torch.Tensor,
         position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
         residual: torch.Tensor | None = None,
+        _cp_full_stream: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(module output, residual stream)``, both UN-ADDED.
 
@@ -428,6 +628,21 @@ class Qwen35Layer(nn.Module):
         the exact sum and diverged 51% of in_proj outputs on captured data,
         so the model loop now carries the (h, residual) pair.
         """
+        if (
+            self.ps.cp_size > 1
+            and not _cp_full_stream
+            and packed_seq_params is not None
+            and getattr(packed_seq_params, "cu_seqlens_q_real", None) is not None
+            and _GDN_HAS_FI_NORM
+            and not _NATIVE_MODE
+        ):
+            # 0-diff (qwen35-0diff-epcp): CP full-stream contract wrapper —
+            # every contract layer (GDN and FA alike) runs its whole body on
+            # the gathered TIGHT full stream; see the _CPGatherTightStream
+            # block above.
+            return self._contract_cp_full_stream(
+                x, position_ids, packed_seq_params, residual
+            )
         if self.full_attn is not None:
             # 0-diff (qwen35-0diff-lite): vLLM FA-layer input norm contract
             # (flashinfer Gemma fused add+RMSNorm on the fp32 sum, TP=1 only),
@@ -454,6 +669,7 @@ class Qwen35Layer(nn.Module):
                 position_ids=position_ids,
                 packed_seq_params=packed_seq_params,
                 residual=residual,
+                disable_cp=_cp_full_stream,
             )
         if self.moe is not None:
             assert self.mlp_norm is not None

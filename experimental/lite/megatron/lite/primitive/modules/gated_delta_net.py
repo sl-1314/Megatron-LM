@@ -687,6 +687,7 @@ class GatedDeltaNet(nn.Module):
         position_ids: torch.Tensor | None = None,
         packed_seq_params=None,
         residual: torch.Tensor | None = None,
+        disable_cp: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Returns ``(o_proj output, residual stream)`` — both UN-ADDED.
 
@@ -733,7 +734,10 @@ class GatedDeltaNet(nn.Module):
         cp_context = None
         reshuffle_cu = None
         cp_div = 1
-        if self.ps.cp_size > 1:
+        # 0-diff (qwen35-0diff-epcp): the CP full-stream contract wrapper runs
+        # this layer on the gathered TIGHT full stream (bitwise == CP-off),
+        # so the in-process CP view must be bypassed there.
+        if self.ps.cp_size > 1 and not disable_cp:
             if self.ps.cp_group is None:
                 raise RuntimeError("CP>1 requires ParallelState.cp_group.")
             if self.cp_mode == "chunkwise":
@@ -862,7 +866,7 @@ class GatedDeltaNet(nn.Module):
         if self._replicate_heads:
             out_width = ensure_divisible(self.v_dim, self.ps.tp_size)
             out = out.narrow(-1, self.ps.tp_rank * out_width, out_width).contiguous()
-        if self.ps.cp_size > 1:
+        if chunkwise or headwise:  # 0-diff: CP reshuffle happened → undo it
             if chunkwise:
                 # Inverse of the pre-recurrence reshuffle: restore the Megatron
                 # attention-load-balanced zigzag layout downstream layers expect.
