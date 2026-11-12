@@ -8,6 +8,7 @@ It intentionally does not require wrapper-specific state on the model.
 from __future__ import annotations
 
 import logging
+import os
 import re
 
 import torch
@@ -814,6 +815,10 @@ def _cache_vllm_norm_weights(
 
     MTP modules (``mtp.*``) have no mapping in this spec and are skipped.
     """
+    if os.environ.get("MLITE_VLLM_CONTRACTS", "1") == "0":
+        # 0-diff: native-baseline switch (C7 layer-3 three-arm) — leave the
+        # cache unfilled so the gated-norm contract stays off in native mode.
+        return
     targets = [
         (name, module)
         for name, module in model.named_modules()

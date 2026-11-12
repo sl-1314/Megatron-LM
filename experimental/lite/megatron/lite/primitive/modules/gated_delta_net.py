@@ -32,10 +32,16 @@ faithful mirror of the upstream packing-aware reshuffle.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.nn.functional as F
+
+# 0-diff: native-baseline switch (C7 layer-3 three-arm comparison) — see
+# model/qwen3_5/lite/model.py; contracts stay the default.
+_NATIVE_MODE = os.environ.get("MLITE_VLLM_CONTRACTS", "1") == "0"
 
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.kernels.jit import jit_fuser
@@ -698,7 +704,12 @@ class GatedDeltaNet(nn.Module):
         # add) with TE's own norm arithmetic: 51% of in_proj outputs diverged
         # on captured data. TP>1 needs the deferred-all-reduce norm variant
         # and a column-sharded gemm — not contract-covered yet.
-        if _HAS_FI_NORM and self.ps.tp_size == 1 and not self._replicate_heads:
+        if (
+            _HAS_FI_NORM
+            and self.ps.tp_size == 1
+            and not self._replicate_heads
+            and not _NATIVE_MODE
+        ):
             y, residual = _vllm_pair_norm(
                 x, residual, self.in_proj.linear.layer_norm_weight, self._in_norm_eps
             )
@@ -829,6 +840,7 @@ class GatedDeltaNet(nn.Module):
             and out.dtype == torch.bfloat16
             and gate.dtype == torch.bfloat16
             and out.shape[-1] == self.dv
+            and not _NATIVE_MODE
         ):
             if self._vllm_norm_w_loaded:
                 w_raw = self._vllm_norm_w

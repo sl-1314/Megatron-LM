@@ -52,6 +52,11 @@ from megatron.lite.primitive.parallel import (
 )
 from megatron.lite.primitive.utils import build_fp8_recipe
 
+# 0-diff: native-baseline switch (C7 layer-3 three-arm comparison).
+# MLITE_VLLM_CONTRACTS=0 disables every vLLM-numerics contract in the model
+# so it runs the ORIGINAL TE training numerics; contracts stay the default.
+_NATIVE_MODE = os.environ.get("MLITE_VLLM_CONTRACTS", "1") == "0"
+
 _SP_GRAD_SUFFIXES: tuple[str, ...] = (
     ".full_attn.qkv.linear.layer_norm_weight",
     ".full_attn.q_norm.weight",
@@ -194,7 +199,7 @@ class SharedExpert(nn.Module):
         # 0-diff: vLLM silu_and_mul contract (see _vllm_swiglu).
         act = (
             _vllm_swiglu(self.gate_up(fc1_input))
-            if fc1_input.dtype == torch.bfloat16
+            if fc1_input.dtype == torch.bfloat16 and not _NATIVE_MODE
             else _swiglu(self.gate_up(fc1_input))
         )
         output = self.down(act)
@@ -350,7 +355,7 @@ class Qwen35Layer(nn.Module):
                 # mul) so the layer is bitwise vs the rollout engine.  Falls
                 # back to the TE path when the kernels/inputs are outside the
                 # C3-validated window (TP=1, bf16, THD).
-                vllm_fa_contract=True,
+                vllm_fa_contract=not _NATIVE_MODE,
                 max_position_embeddings=config.max_position_embeddings,
             )
         else:
@@ -384,11 +389,11 @@ class Qwen35Layer(nn.Module):
                 # 0-diff (qwen35-0diff-lite): route bit-exactly as the rollout
                 # side does (plain bf16 gate GEMM + vLLM topkGating weights);
                 # the fp32 TE gate mis-routed 10-14% of tokens per layer.
-                vllm_topk_contract=True,
+                vllm_topk_contract=not _NATIVE_MODE,
                 # 0-diff: routed experts through vLLM's Triton fused_moe
                 # (bitwise vs the rollout engine; TE grouped-GEMM path stays
                 # the fallback for TP/EP or non-bf16 configs).
-                vllm_fused_moe_contract=True,
+                vllm_fused_moe_contract=not _NATIVE_MODE,
             )
             self.mlp: DenseMLP | None = None
         else:
@@ -442,7 +447,7 @@ class Qwen35Layer(nn.Module):
             assert self.mlp_norm is not None
             # 0-diff (qwen35-0diff-lite): vLLM post-attention norm contract
             # (flashinfer Gemma fused add+RMSNorm on the fp32 sum), TP=1 only.
-            if _GDN_HAS_FI_NORM and self.ps.tp_size == 1:
+            if _GDN_HAS_FI_NORM and self.ps.tp_size == 1 and not _NATIVE_MODE:
                 y, residual = _vllm_pair_norm(
                     h, residual, self.mlp_norm.weight, self._norm_eps
                 )
@@ -573,7 +578,7 @@ class Qwen35Model(nn.Module):
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
             self._norm_eps = config.rms_norm_eps
             self._vllm_head_norm_contract = (
-                _GDN_HAS_FI_NORM and ps.tp_size == 1
+                _GDN_HAS_FI_NORM and ps.tp_size == 1 and not _NATIVE_MODE
             )
 
         self.mtp_embed: VocabParallelEmbedding | None = None
