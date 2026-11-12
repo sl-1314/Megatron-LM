@@ -41,6 +41,274 @@ _KEPT_PSP_FIELDS = (
 )
 
 
+# 0-diff (qwen35-0diff-lite): vLLM FA-path kernel contracts for Qwen3.5
+# --------------------------------------------------------------------------------
+#
+# The rollout side computes each full-attention layer as:
+#   qkv GEMM -> fused_qk_rmsnorm_rope_gate (Triton: split + Gemma QK-RMSNorm +
+#   partial NeoX MRoPE + gate copy in ONE kernel) -> FA3 varlen (paged in the
+#   engine) -> fused_sigmoid_gate_mul (Triton) -> o_proj GEMM.
+# The contract imports and drives the engine's own kernel functions, so the
+# Triton/CuTe binaries are identical -- no transcription risk.  Verified
+# module-by-module bitwise against in-engine captures on the C3 mixed
+# [L,L,L,F] proxy (see c3_fa_replay.py): every stage including the whole
+# decoder layer h_out matches bit-exactly.
+#
+# FA3 layout note: the engine's prefill attention runs the PAGED path
+# (k/v = KV-cache pool + block_table + scheduler_metadata).  A/B on the
+# captures showed the DENSE varlen path (cu_seqlens_k, no block_table) and any
+# page size / scheduler_metadata=None all reproduce the engine output
+# bit-exactly for this causal prefill shape, so the contract uses the dense
+# THD call.  The engine runs the fused kernels with norm_beta=1.0 (Gemma
+# (w+1)); mlite's zero-centered RMSNorm weights store the same raw values.
+#
+# ``positions`` must be (3, T) MRoPE rows (all rows equal for text), matching
+# the engine's 2D path so the kernel's HAS_MROPE specialization is the same.
+# The cos/sin cache is built on the same device as q (GPU libdevice cos/sin;
+# a CPU-built cache differs from the engine's in ~68/16M rows by 1 ulp).
+#
+# ``fused_qk_rmsnorm_rope_gate``, ``flash_attn_varlen_func`` and
+# ``fused_sigmoid_gate_mul`` are inference-only, so gradients go through
+# exact fp32 torch recomputes (C6 tolerance-validated), same pattern as
+# _VllmFusedMoe.
+#
+# Validity window: bf16, TP=1, THD (packed_seq_params given), output_gate,
+# mrope_section, qkv_layout="mcore".  Other configurations fall back to the
+# TE path.
+
+_VLLM_FA_IMPORT_ERROR: str | None = ""
+
+
+def _vllm_fa_fns():
+    """Lazily import vLLM's FA-path kernel entry points; None when unavailable."""
+    global _VLLM_FA_IMPORT_ERROR
+    if _VLLM_FA_IMPORT_ERROR != "":
+        return None
+    try:
+        from vllm.kernels.triton.fused_sigmoid_gate_mul import fused_sigmoid_gate_mul
+        from vllm.model_executor.layers.fused_qk_norm_rope import (
+            fused_qk_rmsnorm_rope_gate,
+        )
+        from vllm.vllm_flash_attn import flash_attn_varlen_func
+
+        return fused_qk_rmsnorm_rope_gate, flash_attn_varlen_func, fused_sigmoid_gate_mul
+    except Exception as e:  # pragma: no cover - env-dependent
+        _VLLM_FA_IMPORT_ERROR = f"{type(e).__name__}: {e}"
+        return None
+
+
+def vllm_fa_available() -> bool:
+    return _vllm_fa_fns() is not None
+
+
+def vllm_fa_cos_sin_cache(
+    rotary_dim: int, theta: float, max_position: int, device: torch.device
+) -> torch.Tensor:
+    """Bit-exact vLLM rotary cos/sin cache (bf16, [max_position, rotary_dim]).
+
+    Same construction as vLLM's RotaryEmbedding._compute_cos_sin_cache, run on
+    ``device`` (GPU libdevice trans; CPU libm differs from the engine's cache
+    in a few 1-ulp rows at large positions).
+    """
+    inv_freq = 1.0 / (
+        theta ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32, device=device) / rotary_dim)
+    )
+    t = torch.arange(max_position, dtype=torch.float32, device=device)
+    freqs = torch.einsum("i,j->ij", t, inv_freq)
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(torch.bfloat16)
+
+
+def _torch_qk_norm_rope_gate(
+    q_gate: torch.Tensor,
+    k: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    eps: float,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    rotary_dim: int,
+    mrope_section: list[int] | None,
+    norm_beta: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Differentiable fp32 recompute of the fused rope kernel's math (backward)."""
+    n_tok = q_gate.shape[0]
+    qg = q_gate.view(n_tok, num_q_heads, 2, head_dim)
+    q, gate = qg[:, :, 0].float(), qg[:, :, 1].float()
+    kf = k.view(n_tok, num_kv_heads, head_dim).float()
+
+    def _gemma_norm(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        # Kernel rounds the normed head to the storage dtype before RoPE;
+        # autograd passes through the cast (straight-through), keeping the
+        # gradient signal while matching the forward's quantization point.
+        # NOTE: w is a flat (head_dim,) vector SHARED across heads (the
+        # kernel indexes w_ptr by head offsets only), like the HF q_norm.
+        var = x.pow(2).mean(dim=-1, keepdim=True)
+        y = x * torch.rsqrt(var + eps) * (w.float() + norm_beta)
+        return y.to(q_gate.dtype).float()
+
+    q = _gemma_norm(q, q_weight)
+    kf = _gemma_norm(kf, k_weight)
+
+    half = rotary_dim // 2
+    cos = cos_sin_cache[:, :half].float()
+    sin = cos_sin_cache[:, half:rotary_dim].float()
+    if mrope_section is not None and positions.dim() == 2:
+        # Interleaved row pattern, exactly the kernel's:
+        # j%3==1 -> row 1 when j < 3*section[1], j%3==2 -> row 2 when
+        # j < 3*section[2], else row 0 (NOT contiguous [s0|s1|s2] blocks).
+        jj = torch.arange(half, device=q_gate.device)
+        row = torch.zeros(half, dtype=torch.long, device=q_gate.device)
+        row = torch.where(
+            (jj % 3 == 1) & (jj < 3 * mrope_section[1]),
+            torch.ones_like(row),
+            row,
+        )
+        row = torch.where(
+            (jj % 3 == 2) & (jj < 3 * mrope_section[2]),
+            torch.full_like(row, 2),
+            row,
+        )
+        pos_per_freq = positions.index_select(0, row).transpose(0, 1)  # (T, half)
+    else:
+        pos_per_freq = positions.reshape(-1)[:n_tok].view(n_tok, 1).expand(n_tok, half)
+    # cosf[t, j] = cache[pos[t, j], j] -- advanced indexing with the row index
+    # alone would append the cache's column dim (giving (T, half, half)).
+    j = torch.arange(half, device=q_gate.device)
+    cosf = cos[pos_per_freq, j][:, None]  # (n_tok, 1, half), broadcasts over heads
+    sinf = sin[pos_per_freq, j][:, None]
+
+    def _rope(x: torch.Tensor) -> torch.Tensor:
+        x1, x2 = x[..., :half], x[..., half:rotary_dim]
+        rest = x[..., rotary_dim:]
+        r1 = x1 * cosf - x2 * sinf
+        r2 = x2 * cosf + x1 * sinf
+        return torch.cat([r1, r2, rest], dim=-1)
+
+    q = _rope(q).to(q_gate.dtype).reshape(n_tok, num_q_heads * head_dim)
+    k_out = _rope(kf).to(k.dtype).reshape(n_tok, num_kv_heads * head_dim)
+    gate_out = gate.to(q_gate.dtype).reshape(n_tok, num_q_heads * head_dim)
+    return q, k_out, gate_out
+
+
+class _VllmQkNormRopeGate(torch.autograd.Function):
+    """fused_qk_rmsnorm_rope_gate: bitwise vLLM forward, exact torch backward."""
+
+    @staticmethod
+    def forward(ctx, q_gate, k, q_weight, k_weight, cos_sin, positions, eps,
+                num_q_heads, num_kv_heads, head_dim, rotary_dim, mrope_section,
+                norm_beta):
+        fn = _vllm_fa_fns()[0]
+        q, k_out, gate = fn(
+            q_gate, k, q_weight, k_weight, cos_sin, positions, eps,
+            num_q_heads, num_kv_heads, head_dim, rotary_dim,
+            norm_beta=norm_beta, mrope_section=mrope_section,
+        )
+        ctx.save_for_backward(q_gate, k, q_weight, k_weight, cos_sin, positions)
+        ctx.meta = (eps, num_q_heads, num_kv_heads, head_dim, rotary_dim,
+                    mrope_section, norm_beta)
+        return q, k_out, gate
+
+    @staticmethod
+    def backward(ctx, dq, dk, dgate):
+        q_gate, k, q_weight, k_weight, cos_sin, positions = ctx.saved_tensors
+        eps, nq, nkv, hd, rot_dim, mrope_section, norm_beta = ctx.meta
+        with torch.enable_grad():
+            qg = q_gate.detach().requires_grad_(True)
+            k_ = k.detach().requires_grad_(True)
+            qw = q_weight.detach().requires_grad_(True)
+            kw = k_weight.detach().requires_grad_(True)
+            q, k_out, gate = _torch_qk_norm_rope_gate(
+                qg, k_, qw, kw, cos_sin, positions, eps, nq, nkv, hd,
+                rot_dim, mrope_section, norm_beta,
+            )
+            grads = torch.autograd.grad(
+                (q, k_out, gate), (qg, k_, qw, kw),
+                (dq.to(q.dtype), dk.to(k_out.dtype), dgate.to(gate.dtype)),
+            )
+        return grads[0], grads[1], grads[2], grads[3], None, None, None, None, None, None, None, None, None
+
+
+def _torch_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale):
+    """Differentiable fp32 recompute of causal varlen attention (backward).
+
+    GQA: q heads are grouped per kv head (nq must divide evenly by nkv).
+    """
+    n_tok, nq, hd = q.shape
+    nkv = k.shape[1]
+    qpg = nq // nkv
+    out = torch.empty_like(q)
+    for i in range(cu_seqlens_q.shape[0] - 1):
+        qlo, qhi = int(cu_seqlens_q[i]), int(cu_seqlens_q[i + 1])
+        klo, khi = int(cu_seqlens_k[i]), int(cu_seqlens_k[i + 1])
+        qs = q[qlo:qhi].float().view(-1, nkv, qpg, hd)
+        ks = k[klo:khi].float()
+        vs = v[klo:khi].float()
+        att = torch.einsum("tghd,sgd->tghs", qs, ks) * softmax_scale
+        t_q, t_k = qs.size(0), ks.size(0)
+        # tril on the 2D (t_q, t_k) matrix, then broadcast over the head dims;
+        # torch.tril on a (T,1,T) tensor would batch dim-0 and keep only s==0.
+        causal = torch.ones(t_q, t_k, device=q.device, dtype=torch.bool).tril()[:, None, None]
+        att = att.masked_fill(~causal, float("-inf"))
+        p = torch.softmax(att, dim=-1)
+        o = torch.einsum("tghs,sgd->tghd", p, vs)
+        out[qlo:qhi] = o.reshape(-1, nq, hd).to(q.dtype)
+    return out
+
+
+class _VllmFA3Varlen(torch.autograd.Function):
+    """flash_attn_varlen_func (dense THD, fa_version=3): bitwise vLLM forward,
+    exact fp32 torch backward."""
+
+    @staticmethod
+    def forward(ctx, q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q,
+                max_seqlen_k, softmax_scale):
+        fn = _vllm_fa_fns()[1]
+        out = fn(
+            q, k, v, max_seqlen_q=max_seqlen_q, cu_seqlens_q=cu_seqlens_q,
+            max_seqlen_k=max_seqlen_k, cu_seqlens_k=cu_seqlens_k,
+            softmax_scale=softmax_scale, causal=True, window_size=(-1, -1),
+            softcap=0.0, fa_version=3,
+        )
+        ctx.save_for_backward(q, k, v, cu_seqlens_q, cu_seqlens_k)
+        ctx.softmax_scale = softmax_scale
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, cu_q, cu_k = ctx.saved_tensors
+        with torch.enable_grad():
+            q_ = q.detach().requires_grad_(True)
+            k_ = k.detach().requires_grad_(True)
+            v_ = v.detach().requires_grad_(True)
+            out = _torch_varlen_attn(q_, k_, v_, cu_q, cu_k, ctx.softmax_scale)
+            grads = torch.autograd.grad(out, (q_, k_, v_), dout.to(out.dtype))
+        return grads[0], grads[1], grads[2], None, None, None, None, None
+
+
+class _VllmSigmoidGateMul(torch.autograd.Function):
+    """fused_sigmoid_gate_mul: bitwise vLLM forward, exact fp32 backward."""
+
+    @staticmethod
+    def forward(ctx, x, gate):
+        fn = _vllm_fa_fns()[2]
+        out = fn(x, gate)
+        ctx.save_for_backward(x, gate)
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, gate = ctx.saved_tensors
+        with torch.enable_grad():
+            x_ = x.detach().float().requires_grad_(True)
+            g_ = gate.detach().float().requires_grad_(True)
+            out = x_ * torch.sigmoid(g_)
+            grads = torch.autograd.grad(out, (x_, g_), dout.float())
+        return grads[0].to(x.dtype), grads[1].to(gate.dtype)
+
+
 class GQAttention(nn.Module):
     """Grouped Query Attention with TE DotProductAttention.
 
@@ -67,6 +335,8 @@ class GQAttention(nn.Module):
         qkv_layout: str = "flat",
         lora_config: LoraConfig | dict | None = None,
         mrope_section: list[int] | None = None,
+        vllm_fa_contract: bool = False,
+        max_position_embeddings: int | None = None,
     ):
         super().__init__()
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
@@ -88,6 +358,23 @@ class GQAttention(nn.Module):
             raise ValueError(f"Unsupported qkv_layout={qkv_layout!r}")
         self._qkv_layout = qkv_layout
         self._mrope_section = list(mrope_section) if mrope_section is not None else None
+        self._vllm_fa_contract = vllm_fa_contract
+        self._max_position_embeddings = max_position_embeddings
+        self._rope_theta = rope_theta
+        self._rotary_percent = rotary_percent
+        self._vllm_cos_sin: torch.Tensor | None = None
+        if vllm_fa_contract:
+            # Validity window of the C3 bitwise verification (see module docstring).
+            if not (output_gate and qkv_layout == "mcore" and mrope_section is not None):
+                raise ValueError(
+                    "vllm_fa_contract requires output_gate, qkv_layout='mcore' and mrope_section."
+                )
+            if not use_thd:
+                raise ValueError("vllm_fa_contract is THD-only (packed_seq_params path).")
+            if ps.tp_size != 1:
+                raise ValueError("vllm_fa_contract supports TP=1 only.")
+            if max_position_embeddings is None:
+                raise ValueError("vllm_fa_contract requires max_position_embeddings.")
 
         # Declaration order follows MC's `SelfAttention` submodule order
         # (linear_proj → linear_qkv → q_layernorm → k_layernorm). `named_
@@ -181,9 +468,27 @@ class GQAttention(nn.Module):
             **cp_kwargs,
         )
 
+    def vllm_fa_engages(self, x: torch.Tensor, packed_seq_params) -> bool:
+        """Whether the vLLM FA contract path will run for this call.
+
+        The contract path consumes the POST pair-norm input (see the module
+        docstring and Qwen35Layer's FA branch); the caller must branch on this
+        BEFORE pre-adding the residual, the way the legacy path requires.
+        """
+        return (
+            self._vllm_fa_contract
+            and packed_seq_params is not None
+            and x.dim() == 3
+            and x.dtype == torch.bfloat16
+            and self.ps.tp_size == 1
+            and _vllm_fa_fns() is not None
+        )
+
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
+        if self.vllm_fa_engages(x, packed_seq_params):
+            return self._vllm_fa_contract_forward(x, position_ids, packed_seq_params)
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
@@ -279,6 +584,91 @@ class GQAttention(nn.Module):
         if self.proj_lora is not None:
             output = output + self.proj_lora(attn_out)
         return output
+
+    def _vllm_fa_contract_forward(
+        self, x: torch.Tensor, position_ids: torch.Tensor | None, packed_seq_params
+    ) -> torch.Tensor:
+        """vLLM FA-path kernel contract (bitwise vs the rollout engine).
+
+        ``x`` must already be the post pair-norm activation (Qwen35Layer's FA
+        branch applies ``_vllm_pair_norm`` with ``qkv.linear.layer_norm_weight``
+        and passes the un-added residual stream through).  Layout math mirrors
+        checkpoint._merge/_unmerge_full_attn_qkvg: the mcore qkv activation is
+        per-kv-group [q|gate|k|v]; the vLLM kernels want per-head interleaved
+        [q|gate] followed by flat k and v.  The GEMM itself runs on the mcore
+        weight via plain F.linear (row permutations of a GEMM output are
+        bitwise-safe: each output element is an independent dot product).
+        """
+        n_tok = x.shape[1] if x.shape[0] == 1 else x.shape[0]
+        # THD arrives as (1, T, H) when multiple sequences are packed and
+        # (T, 1, H) for a single sequence (pack_nested_thd layout); the token
+        # stream itself is identical.
+        x2d = x.reshape(n_tok, -1)
+        nq, nkv, hd = self.num_heads_local, self.num_kv_heads_local, self.head_dim
+        qpg = nq // nkv
+
+        qkv = torch.nn.functional.linear(x2d, self.qkv.linear.weight)
+        mc = qkv.view(n_tok, nkv, 2 * qpg + 2, hd)
+        q_ = mc[:, :, :qpg].reshape(n_tok, nq, hd)
+        gate_ = mc[:, :, qpg : 2 * qpg].reshape(n_tok, nq, hd)
+        k_ = mc[:, :, 2 * qpg].reshape(n_tok, nkv * hd)
+        v_ = mc[:, :, 2 * qpg + 1].reshape(n_tok, nkv * hd)
+        q_gate = torch.stack([q_, gate_], dim=2).reshape(n_tok, nq * 2 * hd)
+
+        pos = position_ids
+        if pos is None:
+            raise ValueError("vllm_fa_contract requires position_ids (MRoPE).")
+        if pos.dim() == 3:  # (3, 1, T) THD batch
+            pos = pos[:, 0]
+        if pos.dim() != 2 or pos.shape[0] != 3:
+            raise ValueError(f"vllm_fa_contract requires (3, T) positions, got {tuple(pos.shape)}")
+
+        if self._vllm_cos_sin is None or self._vllm_cos_sin.device != x2d.device:
+            rotary_dim = int(hd * self._rotary_percent)
+            self._vllm_cos_sin = vllm_fa_cos_sin_cache(
+                rotary_dim, self._rope_theta, self._max_position_embeddings, x2d.device
+            )
+
+        # split + Gemma QK-RMSNorm + partial NeoX MRoPE + gate copy (one Triton
+        # kernel).  mlite's zero-centered weights store the engine's raw
+        # values; the kernel adds norm_beta itself.
+        q_r, k_r, gate_out = _VllmQkNormRopeGate.apply(
+            q_gate,
+            k_,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self._vllm_cos_sin,
+            pos,
+            self._qkv_eps,
+            nq,
+            nkv,
+            hd,
+            int(hd * self._rotary_percent),
+            self._mrope_section,
+            1.0,
+        )
+
+        # FA3 varlen, dense THD call: cu_seqlens are the PADDED per-seq offsets
+        # that match the physical (1, T) token layout; causal masking keeps
+        # true-token rows bitwise unaffected by the pad tail.
+        cu_q = packed_seq_params.cu_seqlens_q
+        max_len = int(packed_seq_params.max_seqlen_q)
+        attn_out = _VllmFA3Varlen.apply(
+            q_r.view(n_tok, nq, hd),
+            k_r.view(n_tok, nkv, hd),
+            v_.view(n_tok, nkv, hd),
+            cu_q,
+            cu_q,
+            max_len,
+            max_len,
+            hd**-0.5,
+        )
+
+        out_sg = _VllmSigmoidGateMul.apply(
+            attn_out.reshape(n_tok, nq * hd), gate_out
+        )
+        out = torch.nn.functional.linear(out_sg, self.proj.linear.weight)
+        return out.reshape(x.shape)
 
     def _qkv_lora_input(self, x: torch.Tensor) -> torch.Tensor:
         linear = self.qkv.linear

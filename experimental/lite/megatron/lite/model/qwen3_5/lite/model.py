@@ -345,6 +345,13 @@ class Qwen35Layer(nn.Module):
                 zero_centered_gamma=True,
                 qkv_layout="mcore",
                 mrope_section=_qwen_mrope_section(config),
+                # 0-diff (qwen35-0diff-lite): drive vLLM's own FA-path kernels
+                # (fused_qk_rmsnorm_rope_gate + FA3 varlen + fused_sigmoid_gate_
+                # mul) so the layer is bitwise vs the rollout engine.  Falls
+                # back to the TE path when the kernels/inputs are outside the
+                # C3-validated window (TP=1, bf16, THD).
+                vllm_fa_contract=True,
+                max_position_embeddings=config.max_position_embeddings,
             )
         else:
             self.linear_attn = GatedDeltaNet(
@@ -405,11 +412,24 @@ class Qwen35Layer(nn.Module):
         so the model loop now carries the (h, residual) pair.
         """
         if self.full_attn is not None:
-            # FA layers keep the legacy pre-added input until their norm is
-            # contract-aligned (needs flash_attn, see EVENTLOG).
-            xs = x if residual is None else residual + x
-            h = self.full_attn(xs, position_ids=position_ids, packed_seq_params=packed_seq_params)
-            residual = xs
+            # 0-diff (qwen35-0diff-lite): vLLM FA-layer input norm contract
+            # (flashinfer Gemma fused add+RMSNorm on the fp32 sum, TP=1 only),
+            # then GQAttention's vLLM FA kernel contract on the post-norm
+            # activation.  qkv.linear.layer_norm_weight stores the raw
+            # input_layernorm.weight (no -1), the convention the kernel wants.
+            if self.full_attn.vllm_fa_engages(x, packed_seq_params) and _GDN_HAS_FI_NORM:
+                y, residual = _vllm_pair_norm(
+                    x,
+                    residual,
+                    self.full_attn.qkv.linear.layer_norm_weight,
+                    self._norm_eps,
+                )
+                h = self.full_attn(y, position_ids=position_ids, packed_seq_params=packed_seq_params)
+            else:
+                # Legacy path: pre-added input into the fused te.LayerNormLinear.
+                xs = x if residual is None else residual + x
+                h = self.full_attn(xs, position_ids=position_ids, packed_seq_params=packed_seq_params)
+                residual = xs
         else:
             assert self.linear_attn is not None
             h, residual = self.linear_attn(
