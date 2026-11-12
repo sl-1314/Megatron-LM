@@ -245,8 +245,14 @@ class _VllmFusedMoeEP(torch.autograd.Function):
         # x / routing-weight grads are this shard's contribution only: sum
         # them across EP (the surrounding network is replicated, so dout —
         # and every other gradient path — is identical on all ranks).
+        # gw must be masked first: the surrogate remaps non-local slots to
+        # local expert 0 with weight 0, which zeroes their FORWARD output
+        # exactly, but d(out)/d(wts_) for those slots is expert0(x) —
+        # garbage that would leak into the router grads through the
+        # all-reduce (dx and expert dW are safe: their slot contributions
+        # scale with wts_ itself and vanish).
         gx = grads[0].contiguous()
-        gw = grads[3].contiguous()
+        gw = grads[3].contiguous() * mask.to(grads[3].dtype)
         dist.all_reduce(gx, group=ctx.ep_group)
         dist.all_reduce(gw, group=ctx.ep_group)
         return gx, grads[1], grads[2], gw.to(weights.dtype), None, None, None, None

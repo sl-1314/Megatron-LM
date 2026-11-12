@@ -371,6 +371,17 @@ def _thd_token_dim(t: torch.Tensor) -> int:
     raise ValueError(f"not a THD stream shape: {tuple(t.shape)}")
 
 
+def _tight_stream_dim(t: torch.Tensor) -> int:
+    """Token dim for the model-level tight-stream CP wrappers.
+
+    _thd_token_dim assumes [T, H] for 2-D tensors, but the packer emits
+    [1, T] rows for input_ids/labels — their token dim is 1.
+    """
+    if t.dim() == 2 and t.shape[0] == 1 and t.shape[1] > 1:
+        return 1
+    return _thd_token_dim(t)
+
+
 _TIGHT_ROW_CACHE: dict = {}
 
 
@@ -855,6 +866,94 @@ class Qwen35Model(nn.Module):
             input_tensor = input_tensor[0] if input_tensor else None
         self._input_tensor = input_tensor
 
+    def _head_ce_cp_tight(self, h, residual, labels, temperature,
+                          calculate_entropy, packed_seq_params) -> dict:
+        """CP wrapper for the head block: gather tight, run CP-off head+CE, scatter.
+
+        Mirrors the CP-off head code exactly (norm contract + head GEMM +
+        vLLM token-logprobs contract) on the gathered TIGHT full stream —
+        bitwise by construction — then slices the log_probs/entropy back to
+        the local shard.  The model-level parameters (final norm, head — and
+        embed via its own wrapper) then hold the TOTAL gradient on every
+        rank, same invariant as the layer contracts.
+
+        Loss normalization: local token sum over the GLOBAL token count
+        (one scalar all-reduce), so each rank's backward reproduces the
+        CP-off mean-loss gradient after the scatter backward's all-reduce.
+        MTP and the fused-CE kernel path are not CP-covered (fall back to
+        the unwrapped path below).
+        """
+        ps = self.ps
+        cp = ps.cp_size
+        cu_pad, cu_real = _cp_tight_meta(packed_seq_params)
+        gather = _CPGatherTightStream.apply
+        scatter = _CPScatterTightToLocal.apply
+        hg = gather(h, _tight_stream_dim(h), cu_pad, cu_real, cp,
+                    ps.cp_rank, ps.cp_group)
+        resg = (gather(residual, _tight_stream_dim(residual), cu_pad, cu_real, cp,
+                       ps.cp_rank, ps.cp_group)
+                if residual is not None else None)
+        lbg = gather(labels, _tight_stream_dim(labels), cu_pad, cu_real, cp,
+                     ps.cp_rank, ps.cp_group)
+        output: dict = {}
+        if (
+            self._vllm_head_norm_contract
+            and resg is not None
+            and hg.dtype == torch.bfloat16
+        ):
+            hidden_for_head, h_sum = _vllm_pair_norm(
+                hg, resg, self.norm.weight, self._norm_eps
+            )
+            output["hidden_states"] = scatter(
+                h_sum, _thd_token_dim(h_sum), cu_pad, cu_real, cp,
+                ps.cp_rank, ps.cp_group)
+        else:
+            if resg is not None:
+                hg = resg + hg
+            output["hidden_states"] = scatter(
+                hg, _thd_token_dim(hg), cu_pad, cu_real, cp,
+                ps.cp_rank, ps.cp_group)
+            hidden_for_head = self.norm(hg)
+        temperature_value = _temperature_to_float(temperature)
+        labels_sb = lbg.transpose(0, 1).contiguous()
+        logits = self.head(hidden_for_head)
+        labels_valid = bool(
+            (labels_sb >= 0).all() and (labels_sb < self.config.vocab_size).all()
+        )
+        entropy = None
+        if (
+            self._vllm_head_norm_contract
+            and temperature_value == 1.0
+            and labels_valid
+            and vllm_token_logprobs_available()
+            and logits.dtype == torch.bfloat16
+        ):
+            log_probs = vllm_token_logprobs(logits, labels_sb)
+            if calculate_entropy:
+                entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
+        else:
+            if temperature_value != 1.0:
+                logits = logits / temperature_value
+            loss = vocab_parallel_cross_entropy(
+                logits, labels_sb, self.ps.tp_group
+            )
+            log_probs = -loss
+            if calculate_entropy:
+                entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
+        lp_local = scatter(log_probs, _thd_token_dim(log_probs), cu_pad,
+                           cu_real, cp, ps.cp_rank, ps.cp_group)
+        output["log_probs"] = lp_local.transpose(0, 1).contiguous()
+        if entropy is not None:
+            ent_local = scatter(entropy, _thd_token_dim(entropy), cu_pad,
+                                cu_real, cp, ps.cp_rank, ps.cp_group)
+            output["entropy"] = ent_local.transpose(0, 1).contiguous()
+        n_global = torch.tensor(
+            [float(lp_local.numel())], device=lp_local.device, dtype=torch.float64
+        )
+        dist.all_reduce(n_global, group=ps.cp_group)
+        output["loss"] = (-lp_local.float().sum()) / n_global
+        return output
+
     def forward(
         self,
         input_ids: torch.Tensor | None = None,
@@ -869,7 +968,26 @@ class Qwen35Model(nn.Module):
     ) -> dict:
         if self.embed is not None:
             assert input_ids is not None
-            h = self.embed(input_ids)
+            if (
+                self.ps.cp_size > 1
+                and packed_seq_params is not None
+                and getattr(packed_seq_params, "cu_seqlens_q_real", None) is not None
+                and _GDN_HAS_FI_NORM
+                and not _NATIVE_MODE
+            ):
+                # 0-diff (qwen35-0diff-epcp): embedding on the gathered TIGHT
+                # full ids — per-rank dW accumulates ALL tokens (the scatter
+                # backward all-reduces), matching the CP-off gradient.
+                cu_pad, cu_real = _cp_tight_meta(packed_seq_params)
+                ids_t = _CPGatherTightStream.apply(
+                    input_ids, _tight_stream_dim(input_ids), cu_pad, cu_real,
+                    self.ps.cp_size, self.ps.cp_rank, self.ps.cp_group)
+                h_t = self.embed(ids_t)
+                h = _CPScatterTightToLocal.apply(
+                    h_t, _thd_token_dim(h_t), cu_pad, cu_real,
+                    self.ps.cp_size, self.ps.cp_rank, self.ps.cp_group)
+            else:
+                h = self.embed(input_ids)
         else:
             if hidden_states is None:
                 hidden_states = self._input_tensor
@@ -937,6 +1055,20 @@ class Qwen35Model(nn.Module):
             output["hidden_states"] = h
         if self.head is not None and labels is not None:
             temperature_value = _temperature_to_float(temperature)
+            if (
+                self.ps.cp_size > 1
+                and packed_seq_params is not None
+                and getattr(packed_seq_params, "cu_seqlens_q_real", None) is not None
+                and not use_fused_kernels
+                and _GDN_HAS_FI_NORM
+                and not _NATIVE_MODE
+            ):
+                # 0-diff (qwen35-0diff-epcp): head+CE on the gathered TIGHT
+                # full stream (see _head_ce_cp_tight).  MTP and the fused-CE
+                # kernel path are not CP-covered and take the unwrapped path.
+                return self._head_ce_cp_tight(
+                    h, residual, labels, temperature, calculate_entropy,
+                    packed_seq_params)
             mtp_result = self._apply_mtp_loss(
                 hidden_for_head,
                 input_ids=input_ids,
