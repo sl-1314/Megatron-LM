@@ -112,6 +112,27 @@ def ensure_vllm_tp_state(tp_size: int, rank: int, local_rank: int) -> bool:
         if not torch.distributed.is_initialized():
             _ERR = "torch.distributed is not initialized"
             return False
+        # Mirror the engine worker's communicator config (2026-11-13):
+        # the engine oracle runs LLM(disable_custom_all_reduce=True), whose
+        # workers call set_custom_all_reduce(False) BEFORE group init — so
+        # custom AR must stay OFF here too for bitwise AR-dispatch parity.
+        # It also skips CustomAllreduce's torch-symmetric-memory MNNVL
+        # rendezvous, which wedged (3-of-4 ranks spinning) on this node.
+        # VLLM_ALLREDUCE_USE_SYMM_MEM likewise mirrors the engine run env
+        # (its AR never serves our >32MB batched norm messages on SM90/tp4
+        # anyway, so numerics are unaffected).
+        #
+        # With custom AR and symm-mem off, an over-budget (>2MB at SM90/tp4)
+        # norm AR lands on the torch.distributed NCCL tail on BOTH sides —
+        # bitwise-verified against the engine (C10_TP_MLITE_BATCHED_PASS).
+        # NOTE the caller-side contract that comes with it: NCCL's bf16
+        # all-reduce is ROW-ORDER-SENSITIVE (chunk/channel-dependent
+        # accumulation with bf16 rounding) — the packed batch must replicate
+        # the engine's per-chunk row layout for bitwise parity.
+        os.environ.setdefault("VLLM_ALLREDUCE_USE_SYMM_MEM", "0")
+        from vllm.distributed.parallel_state import set_custom_all_reduce
+
+        set_custom_all_reduce(False)
         # A private TCP store for vLLM's own process group, distinct from the
         # trainer's MASTER_ADDR/PORT (the probe recipe).
         port = int(os.environ.get("MLITE_VLLM_TP_INIT_PORT", "29701"))
