@@ -639,8 +639,21 @@ class GQAttention(nn.Module):
         if _tpc:
             # 0-diff (qwen35-0diff-epcp): TP contract — column GEMM on the
             # replicated post-norm input with the per-rank shard (engine GEMM
-            # shape, bitwise); backward all-reduces dx over TP.
-            qkv = tp_col_linear(x2d, self.qkv.linear.weight, self.ps.tp_group)
+            # shape, bitwise); backward all-reduces dx over TP.  With kv-head
+            # replication the k/v tail rows of dw are partial (each replica
+            # rank sees only its own q heads) — arm the replica-peer dw sum.
+            kv_reduce = None
+            if self._replicate_kv:
+                kv_reduce = (
+                    2 * self.num_heads_local * self.head_dim,
+                    self.ps.tp_size // self.num_kv_heads,
+                    self.ps.tp_rank,
+                    self.ps.tp_size,
+                )
+            qkv = tp_col_linear(
+                x2d, self.qkv.linear.weight, self.ps.tp_group,
+                kv_replica_reduce=kv_reduce,
+            )
         else:
             qkv = torch.nn.functional.linear(x2d, self.qkv.linear.weight)
         mc = qkv.view(n_tok, nkv, 2 * qpg + 2, hd)

@@ -17,9 +17,13 @@ Module contents:
 - ``vllm_fused_ar_norm_available``: import predicate.
 - ``vllm_fused_ar_norm``: the contract entry — forward is the imported
   ``fused_allreduce_gemma_rms_norm`` (bitwise by construction); backward is
-  the analytic fp32 Gemma-RMSNorm gradient of the pair-norm contract plus
-  the all-reduce transpose (AR backward = AR), which is a tolerance-grade
-  surrogate (same pattern as every other 0-diff contract).
+  the analytic fp32 Gemma-RMSNorm gradient of the pair-norm contract with
+  identity AR-transpose (each partial receives the full ds), which is a
+  tolerance-grade surrogate (same pattern as every other 0-diff contract).
+  The entry mirrors the engine's own dispatch: when the fused trtllm kernel
+  is NOT eligible (num_tokens above the kernel's max for this tp/dtype —
+  large packed training batches), it runs the engine's decomposed fallback
+  (vLLM's TP all-reduce + the pair-norm contract) instead.
 - ``tp_col_linear``: column-parallel GEMM on a REPLICATED input — the TP
   contract's shape for every column projection (engine GEMM shapes, bitwise
   forward; backward all-reduces dx over the TP group, dW stays local).
@@ -139,19 +143,32 @@ class _VllmFusedARNorm(torch.autograd.Function):
 
     Backward (surrogate): the same analytic Gemma-RMSNorm gradient as the
     pair-norm contract (_VllmGemmaFusedAddRmsNorm), evaluated on
-    s = fp32(AR(x)) + fp32(residual), with dx additionally passed through
-    the all-reduce transpose (AR backward = AR, since AR is a sum-replicate).
+    s = fp32(AR(x)) + fp32(residual).  dx is the IDENTITY (no AR): s is the
+    sum-replicate of the partials, so every rank's x_partial receives the
+    same full ds (Megatron g-op semantics — the plain-TP loss is computed
+    on the replicated stream, and an AR of the already-identical ds would
+    scale gradients by tp_size per layer boundary).
     """
 
     @staticmethod
     def forward(ctx, x, residual, weight, eps):
         op = _import_op()
         assert op is not None, f"vllm fused AR+norm unavailable: {_ERR}"
-        # The kernel writes the new residual into the hidden-states buffer
-        # in place — operate on clones so the caller's tensors (and the
-        # autograd graph) stay intact.
+        # The trtllm kernel writes the NEW RESIDUAL (all_reduce(x_partial) +
+        # residual) INTO the hidden-states buffer in place and returns
+        # (norm_out, hidden_states) — the returned res_out IS the mutated x
+        # buffer (vllm's own docstring: "the kernel writes the new residual
+        # ... into the hidden_states buffer ... leaving `residual`
+        # untouched").  Operate on clones so the caller's tensors stay
+        # intact, and save PRE-OP clones: save_for_backward stores tensor
+        # OBJECTS, so saving x2 after the call would record the overwritten
+        # buffer (s, not the per-rank partial) and the backward would
+        # all-reduce the already-summed s (~5x the true sum, rstd off by the
+        # same factor — the C10 g0 fused-path grad attenuation bug).
         x2 = x.reshape(-1, x.shape[-1]).contiguous().clone()
         res2 = residual.reshape(-1, residual.shape[-1]).contiguous().clone()
+        x_pre = x2.clone()
+        res_pre = res2.clone()
         w2 = weight.contiguous()
         norm = SimpleNamespace(weight=w2, variance_epsilon=eps)
         cfg = _STATE["cfg"]
@@ -159,7 +176,7 @@ class _VllmFusedARNorm(torch.autograd.Function):
 
         with set_current_vllm_config(cfg):
             y, res_out = op(x2, res2, norm)
-        ctx.save_for_backward(x2, res2, w2)
+        ctx.save_for_backward(x_pre, res_pre, w2)
         ctx.eps = eps
         ctx.x_shape = x.shape
         ctx.res_shape = residual.shape
@@ -192,16 +209,45 @@ class _VllmFusedARNorm(torch.autograd.Function):
         t = (dyf * (s * g)).sum(-1, keepdim=True)
         ds = A - (rstd * rstd * rstd) * (s / n) * t + dres.float()
         dw = (dyf * (s * rstd)).sum(0)
-        # AR transpose: each rank's x_partial receives the (replicated) sum
-        # of all ranks' ds contributions.
-        dx = ds.contiguous()
-        dist.all_reduce(dx, group=group)
+        # s = AR(x_partial) + residual: the sum-replicate's transpose gives
+        # EVERY rank's x_partial the same full ds (identity, no AR — see the
+        # class docstring; an AR here would 4x-scale grads per boundary).
+        dx = ds
         return (
             dx.to(x0.dtype).view(ctx.x_shape),
             ds.to(r0.dtype).view(ctx.res_shape),
             dw.to(weight.dtype),
             None,
         )
+
+
+def _import_eligibility():
+    """vLLM's own fused-path predicate (private, same module as the op)."""
+    try:
+        from vllm.model_executor.layers.fused_allreduce_gemma_rms_norm import (
+            _can_use_flashinfer,
+        )
+
+        return _can_use_flashinfer
+    except Exception:  # pragma: no cover - env-dependent
+        return None
+
+
+class _VllmARIdentity(torch.autograd.Function):
+    """vLLM's TP all-reduce (out-of-place, custom-AR-or-NCCL), identity backward.
+
+    The g-op transpose: the forward maps the local partial to the replicated
+    sum, so every rank's partial receives the SAME full gradient (no AR —
+    an AR of the already-identical ds would scale grads by tp_size).
+    """
+
+    @staticmethod
+    def forward(ctx, x, ar_fn):
+        return ar_fn(x)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad, None
 
 
 def vllm_fused_ar_norm(
@@ -212,13 +258,45 @@ def vllm_fused_ar_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Deferred-AR norm sync point: (y, new_residual) per rank.
 
-    ``x`` is the LOCAL partial (un-reduced row-parallel output); the op
-    all-reduces internally.  See the module docstring for the contract.
+    ``x`` is the LOCAL partial (un-reduced row-parallel output).  Mirrors
+    the engine's own dispatch in ``fused_allreduce_gemma_rms_norm``: the
+    fused trtllm AR+norm kernel when eligible (num_tokens <= the kernel's
+    max_token_num for this tp/dtype), else the engine's decomposed fallback
+    (tensor_model_parallel_all_reduce + GemmaRMSNorm pair).  Large packed
+    training batches take the fallback — exactly like the engine.
     """
     if not _STATE["inited"]:  # pragma: no cover - defensive
         raise RuntimeError("ensure_vllm_tp_state must run before vllm_fused_ar_norm")
-    y, res_out = _VllmFusedARNorm.apply(x, residual, weight, eps)
-    return y, res_out
+    x_shape, res_shape = x.shape, residual.shape
+    x2 = x.reshape(-1, x_shape[-1])
+    ok = False
+    elig = _import_eligibility()
+    if elig is not None:
+        try:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            tp_size = get_tensor_model_parallel_world_size()
+            if tp_size > 1:
+                ok = bool(elig(x2.contiguous(), tp_size)[0])
+        except Exception:  # pragma: no cover - env-dependent
+            ok = False
+    if ok:
+        return _VllmFusedARNorm.apply(x, residual, weight, eps)
+    # Engine decomposed fallback: AR (vLLM's own dispatch, out-of-place,
+    # identity backward) + the C7-validated pair-norm contract.  The engine
+    # model is the platform overlay vllm/models/qwen3_5/nvidia/model.py:
+    # fused_allreduce_gemma_rms_norm's fallback runs ``norm(reduced,
+    # residual)`` on ITS Qwen3_5RMSNorm, whose forward is flashinfer's
+    # gemma_fused_add_rmsnorm — the same kernel the pair-norm contract
+    # drives (the generic ir-native GemmaRMSNorm is NOT what runs here).
+    from vllm.distributed import tensor_model_parallel_all_reduce
+
+    from megatron.lite.primitive.modules.gated_delta_net import _vllm_pair_norm
+
+    res2 = residual.reshape(-1, res_shape[-1])
+    ar = _VllmARIdentity.apply(x2.contiguous(), tensor_model_parallel_all_reduce)
+    y2, res_out2 = _vllm_pair_norm(ar, res2, weight, eps)
+    return y2.view(x_shape), res_out2.view(res_shape)
 
 
 class _TPColMatmul(torch.autograd.Function):
@@ -231,15 +309,27 @@ class _TPColMatmul(torch.autograd.Function):
     Backward: ``dW`` is the shard's local gradient (correct — only this
     rank's partial output flowed through it); ``dx`` is all-reduced over the
     TP group, because the replicated input feeds every rank's shard and the
-    true gradient is the sum of all contributions.  (The output's own
-    all-reduce lives in the FOLLOWING norm's ``_VllmFusedARNorm`` backward,
-    which returns the AR-transposed gradient to this op.)
+    true gradient is the sum of all contributions (Megatron f-op).  The
+    row-parallel partials this op's chain eventually produces are summed by
+    the FOLLOWING norm's forward AR, whose backward is the identity.
+
+    ``kv_replica_reduce`` (GQA kv-head replication, num_kv_heads < tp):
+    ranks sharing a kv head (r // replicas) hold the SAME logical k/v weight
+    rows, but each rank's local attention only backprops its own q heads —
+    its k/v-row dw is a PARTIAL.  The backward all-gathers the tail row
+    block [kv_start:] and sums it across the rank's replica peers so every
+    replica holds the total dw (keeps replicas bitwise in sync through
+    optimizer steps).  Q/gate rows are rank-unique and stay local.
     """
 
     @staticmethod
-    def forward(ctx, x, weight, group):
+    def forward(ctx, x, weight, group, kv_start=-1, replicas=1, tp_rank=0, tp_size=1):
         ctx.group = group
         ctx.x_shape = x.shape
+        ctx.kv_start = kv_start
+        ctx.replicas = replicas
+        ctx.tp_rank = tp_rank
+        ctx.tp_size = tp_size
         x2 = x.reshape(-1, x.shape[-1])
         y = torch.nn.functional.linear(x2, weight)
         ctx.save_for_backward(x2, weight)
@@ -250,11 +340,37 @@ class _TPColMatmul(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         dy2 = dy.reshape(-1, dy.shape[-1])
         dw = dy2.t().matmul(x)
+        if ctx.kv_start >= 0 and ctx.replicas > 1:
+            import torch.distributed as dist
+
+            tail = dw[ctx.kv_start :].contiguous()
+            bufs = [torch.empty_like(tail) for _ in range(ctx.tp_size)]
+            dist.all_gather(bufs, tail, group=ctx.group)
+            my_group = ctx.tp_rank // ctx.replicas
+            total = sum(
+                b for r, b in enumerate(bufs) if r // ctx.replicas == my_group
+            )
+            dw = torch.cat([dw[: ctx.kv_start], total.to(dw.dtype)], dim=0)
         dx = dy2.matmul(weight)
         tp_all_reduce_(dx, ctx.group)
-        return dx.view(ctx.x_shape), dw, None
+        return dx.view(ctx.x_shape), dw, None, None, None, None, None
 
 
-def tp_col_linear(x: torch.Tensor, weight: torch.Tensor, group):
-    """Column GEMM on a replicated input; see ``_TPColMatmul``."""
-    return _TPColMatmul.apply(x, weight, group)
+def tp_col_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    group,
+    kv_replica_reduce: tuple[int, int, int, int] | None = None,
+):
+    """Column GEMM on a replicated input; see ``_TPColMatmul``.
+
+    ``kv_replica_reduce`` = (kv_row_start, replicas, tp_rank, tp_size) arms
+    the backward's replica-peer summation of the k/v row block of dw (GQA
+    kv-head replication; see the class docstring).
+    """
+    if kv_replica_reduce is None:
+        return _TPColMatmul.apply(x, weight, group)
+    kv_start, replicas, tp_rank, tp_size = kv_replica_reduce
+    return _TPColMatmul.apply(
+        x, weight, group, kv_start, replicas, tp_rank, tp_size
+    )

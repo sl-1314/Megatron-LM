@@ -186,8 +186,19 @@ def _merge_full_attn_qkvg_tp_shards(
         packed[group, q_end + off : q_end + off + nq_local * hd] = rows[
             nq_local * hd : 2 * nq_local * hd
         ]
-        packed[group, 2 * q_end : 2 * q_end + hd] = rows[2 * nq_local * hd]
-        packed[group, 2 * q_end + hd : 2 * q_end + 2 * hd] = rows[2 * nq_local * hd + 1]
+        # k/v tail rows: SLICE the [hd] row blocks (a bare rows[i] broadcasts
+        # one [hidden] row across the whole block — caught by the C10 TP grad
+        # round-trip test).  Ranks replicating a kv head hold identical
+        # weights, so the last writer's overwrite is idempotent; for GRAD
+        # shards the caller must pre-sync the replica tails (the contract's
+        # tp_col_linear replica-reduce) or the peers' partials overwrite
+        # each other.
+        packed[group, 2 * q_end : 2 * q_end + hd] = rows[
+            2 * nq_local * hd : 2 * nq_local * hd + hd
+        ]
+        packed[group, 2 * q_end + hd : 2 * q_end + 2 * hd] = rows[
+            2 * nq_local * hd + hd : 2 * nq_local * hd + 2 * hd
+        ]
     return packed.reshape(-1, hidden).contiguous()
 
 
