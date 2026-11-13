@@ -16,6 +16,11 @@ from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg_for_tp,
 )
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
+from megatron.lite.primitive.modules.fused_ar_norm import (
+    tp_all_reduce_,
+    tp_col_linear,
+    tp_contract_active,
+)
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
@@ -199,7 +204,7 @@ class _VllmQkNormRopeGate(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q_gate, k, q_weight, k_weight, cos_sin, positions, eps,
                 num_q_heads, num_kv_heads, head_dim, rotary_dim, mrope_section,
-                norm_beta):
+                norm_beta, tp_group=None):
         fn = _vllm_fa_fns()[0]
         q, k_out, gate = fn(
             q_gate, k, q_weight, k_weight, cos_sin, positions, eps,
@@ -209,6 +214,7 @@ class _VllmQkNormRopeGate(torch.autograd.Function):
         ctx.save_for_backward(q_gate, k, q_weight, k_weight, cos_sin, positions)
         ctx.meta = (eps, num_q_heads, num_kv_heads, head_dim, rotary_dim,
                     mrope_section, norm_beta)
+        ctx.tp_group = tp_group
         return q, k_out, gate
 
     @staticmethod
@@ -228,7 +234,12 @@ class _VllmQkNormRopeGate(torch.autograd.Function):
                 (q, k_out, gate), (qg, k_, qw, kw),
                 (dq.to(q.dtype), dk.to(k_out.dtype), dgate.to(gate.dtype)),
             )
-        return grads[0], grads[1], grads[2], grads[3], None, None, None, None, None, None, None, None, None
+        # 0-diff (qwen35-0diff-epcp): at TP>1 the flat q/k norm weights are
+        # replicated but only the LOCAL heads flow through this rank — sum
+        # the shard contributions across TP (contract only).
+        tp_all_reduce_(grads[2], ctx.tp_group)
+        tp_all_reduce_(grads[3], ctx.tp_group)
+        return grads[0], grads[1], grads[2], grads[3], None, None, None, None, None, None, None, None, None, None
 
 
 def _torch_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, softmax_scale):
@@ -371,8 +382,13 @@ class GQAttention(nn.Module):
                 )
             if not use_thd:
                 raise ValueError("vllm_fa_contract is THD-only (packed_seq_params path).")
-            if ps.tp_size != 1:
-                raise ValueError("vllm_fa_contract supports TP=1 only.")
+            if ps.tp_size != 1 and not tp_contract_active():
+                # 0-diff (qwen35-0diff-epcp): TP>1 is contract-covered only
+                # after ensure_vllm_tp_state armed the plain-TP deferred-AR
+                # contract (model constructor); native TP>1 keeps the raise.
+                raise ValueError(
+                    "vllm_fa_contract supports TP=1 only (TP>1 requires the TP contract)."
+                )
             if max_position_embeddings is None:
                 raise ValueError("vllm_fa_contract requires max_position_embeddings.")
 
@@ -386,6 +402,18 @@ class GQAttention(nn.Module):
         self.proj = RowParallelLinear(num_attention_heads * head_dim, hidden_size, ps, bias=False)
         q_cols = num_attention_heads * (2 if output_gate else 1)
         qkv_size = (q_cols + 2 * num_key_value_heads) * head_dim
+        if ps.tp_size > 1 and tp_contract_active():
+            # 0-diff (qwen35-0diff-epcp): TP contract — with KV head
+            # replication (num_kv_heads < tp) the per-rank qkv rows are NOT
+            # qkv_size/tp (the local layout is [q_local, gate_local, k, v]
+            # per replicated kv head, N=2560 at 16q/2kv/tp4).  Size the
+            # (bypassed) te param so the loader's per-rank shard fills it
+            # exactly; at tp=1 / non-replicated tp this equals qkv_size.
+            local_rows = (
+                num_attention_heads // ps.tp_size * (2 if output_gate else 1)
+                + 2 * self.num_kv_heads_local
+            ) * head_dim
+            qkv_size = local_rows * ps.tp_size
         self.qkv = ColumnParallelLinear(
             hidden_size,
             qkv_size,
@@ -480,7 +508,7 @@ class GQAttention(nn.Module):
             and packed_seq_params is not None
             and x.dim() == 3
             and x.dtype == torch.bfloat16
-            and self.ps.tp_size == 1
+            and (self.ps.tp_size == 1 or tp_contract_active())
             and _vllm_fa_fns() is not None
         )
 
@@ -606,8 +634,15 @@ class GQAttention(nn.Module):
         x2d = x.reshape(n_tok, -1)
         nq, nkv, hd = self.num_heads_local, self.num_kv_heads_local, self.head_dim
         qpg = nq // nkv
+        _tpc = self.ps.tp_size > 1 and tp_contract_active()
 
-        qkv = torch.nn.functional.linear(x2d, self.qkv.linear.weight)
+        if _tpc:
+            # 0-diff (qwen35-0diff-epcp): TP contract — column GEMM on the
+            # replicated post-norm input with the per-rank shard (engine GEMM
+            # shape, bitwise); backward all-reduces dx over TP.
+            qkv = tp_col_linear(x2d, self.qkv.linear.weight, self.ps.tp_group)
+        else:
+            qkv = torch.nn.functional.linear(x2d, self.qkv.linear.weight)
         mc = qkv.view(n_tok, nkv, 2 * qpg + 2, hd)
         q_ = mc[:, :, :qpg].reshape(n_tok, nq, hd)
         gate_ = mc[:, :, qpg : 2 * qpg].reshape(n_tok, nq, hd)
@@ -646,6 +681,7 @@ class GQAttention(nn.Module):
             int(hd * self._rotary_percent),
             self._mrope_section,
             1.0,
+            self.ps.tp_group if _tpc else None,
         )
 
         # FA3 varlen, dense THD call: cu_seqlens are the PADDED per-seq offsets

@@ -80,10 +80,21 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
     rather than the connector.
     """
     ps = _parallel_state(model)
+    # 0-diff (qwen35-0diff-epcp): the plain-TP contract keeps the FULL
+    # replicated token stream on every rank (no SP scatter), and the engine
+    # runs its GEMMs at the TRUE unpadded M — TP-padding the stream would
+    # change cuBLAS kernel selection (the C10 CP 1-ulp lesson).  Align to 1
+    # under the TP contract; native TP keeps the tp-aligned SP layout.
+    tp_align = ps.tp_size
+    if ps.tp_size > 1 and ps.cp_size == 1:
+        from megatron.lite.primitive.modules.fused_ar_norm import tp_contract_active
+
+        if tp_contract_active():
+            tp_align = 1
     seq_lens = batch.seq_lens
     packed = pack_nested_thd(
         nested_from_packed(batch.input_ids, seq_lens),
-        tp_size=ps.tp_size,
+        tp_size=tp_align,
         cp_size=ps.cp_size,
         cp_rank=ps.cp_rank,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
@@ -123,9 +134,17 @@ def unpack_thd_forward_output(
 ) -> torch.Tensor:
     """Reverse a zigzag-CP THD model output back to jagged true-length form."""
     ps = _parallel_state(model)
+    # 0-diff (qwen35-0diff-epcp): mirror pack_thd_forward_kwargs — the TP
+    # contract's output is the full unpadded stream on every rank.
+    tp_align = ps.tp_size
+    if ps.tp_size > 1 and ps.cp_size == 1:
+        from megatron.lite.primitive.modules.fused_ar_norm import tp_contract_active
+
+        if tp_contract_active():
+            tp_align = 1
     meta = thd_pack_meta(
         batch.seq_lens,
-        tp_size=ps.tp_size,
+        tp_size=tp_align,
         cp_size=ps.cp_size,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
     )

@@ -18,6 +18,14 @@ from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
+from megatron.lite.primitive.modules.fused_ar_norm import (
+    ensure_vllm_tp_state,
+    tp_all_reduce_,
+    tp_col_linear,
+    tp_contract_active,
+    vllm_fused_ar_norm,
+    vllm_fused_ar_norm_available,
+)
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 from megatron.lite.primitive.modules.gated_delta_net import (
     _HAS_FI_NORM as _GDN_HAS_FI_NORM,
@@ -50,6 +58,7 @@ from megatron.lite.primitive.parallel import (
     gather_from_sequence_parallel,
     scatter_to_sequence_parallel,
 )
+from megatron.lite.primitive.parallel.linear import _AllGatherLastDim
 from megatron.lite.primitive.utils import build_fp8_recipe
 
 # 0-diff: native-baseline switch (C7 layer-3 three-arm comparison).
@@ -130,6 +139,54 @@ class DenseMLP(nn.Module):
         return self.down(_swiglu(self.gate_up(x)))
 
 
+class _TPSharedExpert(torch.autograd.Function):
+    """Shared expert at TP>1: bitwise engine mirror, torch backward + ARs.
+
+    Forward is the exact plain-torch mirror of the engine's per-rank shared
+    expert (Qwen2MoeMLP on the loader's TP shards: gate_up / down GEMMs on
+    the [gate_shard; up_shard] / I-column-block weights, sigmoid gate on the
+    raw expert_gate logits) — bitwise vs the engine's captured shared_out on
+    4/4 ranks (scratch/c10_tp_moe_probe.py, C10_TP_MOE_PASS).  Output is the
+    PARTIAL (deferred AR — the combine with the routed partial is reduced by
+    the following norm's fused AR kernel).
+
+    Backward recomputes the same chain under autograd and all-reduces dx
+    (replicated input) and d(shared_gate) (replicated weight); the gate_up /
+    down shard grads stay local.
+    """
+
+    @staticmethod
+    def forward(ctx, x, w_gate_up, w_down, w_shared_gate, tp_group):
+        gate_up = torch.nn.functional.linear(x, w_gate_up)
+        gu, gu2 = gate_up.chunk(2, dim=-1)
+        act = torch.nn.functional.silu(gu) * gu2
+        down = torch.nn.functional.linear(act, w_down)
+        gate_logits = torch.nn.functional.linear(x, w_shared_gate)
+        out = torch.sigmoid(gate_logits) * down
+        ctx.save_for_backward(x, w_gate_up, w_down, w_shared_gate)
+        ctx.tp_group = tp_group
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, w_gate_up, w_down, w_shared_gate = ctx.saved_tensors
+        with torch.enable_grad():
+            x_ = x.detach().requires_grad_(True)
+            a_ = w_gate_up.detach().requires_grad_(True)
+            b_ = w_down.detach().requires_grad_(True)
+            g_ = w_shared_gate.detach().requires_grad_(True)
+            gate_up = torch.nn.functional.linear(x_, a_)
+            gu, gu2 = gate_up.chunk(2, dim=-1)
+            act = torch.nn.functional.silu(gu) * gu2
+            down = torch.nn.functional.linear(act, b_)
+            gate_logits = torch.nn.functional.linear(x_, g_)
+            out = torch.sigmoid(gate_logits) * down
+            grads = torch.autograd.grad(out, (x_, a_, b_, g_), dout)
+        tp_all_reduce_(grads[0], ctx.tp_group)  # dx: replicated input
+        tp_all_reduce_(grads[3], ctx.tp_group)  # d(shared_gate): replicated
+        return grads[0], grads[1], grads[2], grads[3], None
+
+
 class SharedExpert(nn.Module):
     _stream: torch.cuda.Stream | None = None
 
@@ -164,7 +221,12 @@ class SharedExpert(nn.Module):
             return self.linear(x)
 
     def __init__(
-        self, config: Qwen35Config, ps: ParallelState, *, use_plain_te_linear: bool = False
+        self,
+        config: Qwen35Config,
+        ps: ParallelState,
+        *,
+        use_plain_te_linear: bool = False,
+        vllm_tp_contract: bool = False,
     ):
         super().__init__()
         ffn = config.shared_expert_intermediate_size
@@ -177,6 +239,10 @@ class SharedExpert(nn.Module):
         self.shared_gate = nn.Linear(config.hidden_size, 1, bias=False)
         self.tp_group = ps.tp_group
         self.use_mcore_overlap_graph = bool(use_plain_te_linear and ps.tp_size == 1)
+        # 0-diff (qwen35-0diff-epcp): TP contract — plain GEMMs on the loader
+        # shards, PARTIAL output (deferred AR); te wrappers are SP-aware at
+        # tp>1 and would all-gather/mis-reduce instead.
+        self.vllm_tp_contract = bool(vllm_tp_contract and ps.tp_size > 1)
 
     @staticmethod
     def _get_stream() -> torch.cuda.Stream:
@@ -191,6 +257,20 @@ class SharedExpert(nn.Module):
             grad_fn._set_sequence_nr(torch.iinfo(torch.int).max)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.vllm_tp_contract and x.dtype == torch.bfloat16 and not _NATIVE_MODE:
+            # 0-diff (qwen35-0diff-epcp): engine mirror on the loader's TP
+            # shards (C10_TP_MOE_PASS) — partial output, deferred AR; the
+            # backward all-reduces dx / d(shared_gate) inside the Function.
+            shape = x.shape
+            x2d = x.reshape(-1, shape[-1])
+            out = _TPSharedExpert.apply(
+                x2d,
+                self.gate_up.linear.weight,
+                self.down.linear.weight,
+                self.shared_gate.weight,
+                self.tp_group,
+            )
+            return out.view(shape)
         gate_val = self.shared_gate(x).sigmoid()
         fc1_input = x
         if self.use_mcore_overlap_graph:
@@ -224,6 +304,7 @@ class MoELayer(nn.Module):
         moe_permute_fusion: bool | None = None,
         vllm_topk_contract: bool = False,
         vllm_fused_moe_contract: bool = False,
+        vllm_tp_contract: bool = False,
     ):
         super().__init__()
         if fp8:
@@ -236,11 +317,28 @@ class MoELayer(nn.Module):
             router_dtype=router_dtype,
             vllm_topk_contract=vllm_topk_contract,
         )
-        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        self.ps = ps
+        # 0-diff (qwen35-0diff-epcp): TP>1 plain-TP contract — the loader
+        # shards each expert's intermediate dim, the routed call drives
+        # fused_experts on the per-rank shards with NO all-reduce (deferred
+        # AR in the next norm) and the shared expert runs the engine mirror.
+        self.vllm_tp_contract = bool(
+            vllm_tp_contract
+            and ps.tp_size > 1
+            and ps.ep_size == 1
+            and ps.etp_size == 1
+            and not fp8
+        )
+        self.experts = Experts(
+            config,
+            ps,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
+            expert_tp_size=ps.tp_size if self.vllm_tp_contract else 1,
+        )
         # 0-diff (qwen35-0diff-epcp): EP>1 is served by the per-shard
         # vllm_fused_moe_ep contract (bitwise via pre-sum all-reduce + local
         # slot-order moe_sum), so the contract no longer requires ep_size==1.
-        self.ps = ps
         self.vllm_fused_moe_contract = bool(
             vllm_fused_moe_contract
             and vllm_topk_contract
@@ -255,7 +353,12 @@ class MoELayer(nn.Module):
             use_deepep=use_deepep,
             moe_permute_fusion=moe_permute_fusion,
         )
-        self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
+        self.shared_expert = SharedExpert(
+            config,
+            ps,
+            use_plain_te_linear=shared_expert_plain_te,
+            vllm_tp_contract=self.vllm_tp_contract,
+        )
         self.preserve_3d_graph = bool(preserve_3d_graph)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -272,7 +375,9 @@ class MoELayer(nn.Module):
             with torch.cuda.stream(side_stream):
                 shared_out = self.shared_expert(shared_input)
         scores, indices = self.router(router_input)
-        if self.vllm_fused_moe_contract and x_2d.dtype == torch.bfloat16:
+        if (
+            self.vllm_fused_moe_contract or self.vllm_tp_contract
+        ) and x_2d.dtype == torch.bfloat16:
             # 0-diff: drive vLLM's Triton fused_moe (same binaries the
             # rollout engine runs) on the stacked expert weights — bitwise
             # routed output; see experts.vllm_fused_moe.
@@ -281,12 +386,20 @@ class MoELayer(nn.Module):
                 vllm_fused_moe,
                 vllm_fused_moe_available,
                 vllm_fused_moe_ep,
+                vllm_fused_moe_tp,
             )
 
             if vllm_fused_moe_available():
                 w13 = stack_expert_weights(self.experts.fc1)
                 w2 = stack_expert_weights(self.experts.fc2)
-                if self.ps.ep_size > 1:
+                if self.vllm_tp_contract:
+                    # 0-diff (qwen35-0diff-epcp): per-rank sharded call, NO
+                    # all-reduce (deferred AR; C10_TP_MOE_PASS replay).
+                    routed_out = vllm_fused_moe_tp(
+                        x_2d.contiguous(), w13, w2, scores, indices,
+                        self.ps.tp_group,
+                    )
+                elif self.ps.ep_size > 1:
                     routed_out = vllm_fused_moe_ep(
                         x_2d.contiguous(), w13, w2, scores, indices,
                         self.ps.ep_group, self.ps.ep_rank,
@@ -506,10 +619,15 @@ class Qwen35Layer(nn.Module):
         use_thd: bool = False,
         deterministic: bool = False,
         gdn_cp_mode: str = "headwise",
+        vllm_tp_contract: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         self.ps = ps
+        # 0-diff (qwen35-0diff-epcp): plain-TP deferred-AR contract — every
+        # sublayer boundary norm is the fused AR+Gemma norm sync point on the
+        # previous row-parallel partial.  False at TP=1 and in native mode.
+        self._vllm_tp_contract = bool(vllm_tp_contract and ps.tp_size > 1)
         self._norm_eps = config.rms_norm_eps
         self._layer_type = config.layer_type_at(layer_idx)
         self.full_attn: FullAttention | None = None
@@ -573,6 +691,7 @@ class Qwen35Layer(nn.Module):
                 # (bitwise vs the rollout engine; TE grouped-GEMM path stays
                 # the fallback for TP/EP or non-bf16 configs).
                 vllm_fused_moe_contract=not _NATIVE_MODE,
+                vllm_tp_contract=self._vllm_tp_contract,
             )
             self.mlp: DenseMLP | None = None
         else:
@@ -656,17 +775,26 @@ class Qwen35Layer(nn.Module):
             )
         if self.full_attn is not None:
             # 0-diff (qwen35-0diff-lite): vLLM FA-layer input norm contract
-            # (flashinfer Gemma fused add+RMSNorm on the fp32 sum, TP=1 only),
-            # then GQAttention's vLLM FA kernel contract on the post-norm
-            # activation.  qkv.linear.layer_norm_weight stores the raw
+            # (flashinfer Gemma fused add+RMSNorm on the fp32 sum; the fused
+            # AR variant at TP>1 — see fused_ar_norm), then GQAttention's
+            # vLLM FA kernel contract on the post-norm activation.
+            # qkv.linear.layer_norm_weight stores the raw
             # input_layernorm.weight (no -1), the convention the kernel wants.
             if self.full_attn.vllm_fa_engages(x, packed_seq_params) and _GDN_HAS_FI_NORM:
-                y, residual = _vllm_pair_norm(
-                    x,
-                    residual,
-                    self.full_attn.qkv.linear.layer_norm_weight,
-                    self._norm_eps,
-                )
+                if self._vllm_tp_contract and residual is not None:
+                    y, residual = vllm_fused_ar_norm(
+                        x,
+                        residual,
+                        self.full_attn.qkv.linear.layer_norm_weight,
+                        self._norm_eps,
+                    )
+                else:
+                    y, residual = _vllm_pair_norm(
+                        x,
+                        residual,
+                        self.full_attn.qkv.linear.layer_norm_weight,
+                        self._norm_eps,
+                    )
                 h = self.full_attn(y, position_ids=position_ids, packed_seq_params=packed_seq_params)
             else:
                 # Legacy path: pre-added input into the fused te.LayerNormLinear.
@@ -685,11 +813,21 @@ class Qwen35Layer(nn.Module):
         if self.moe is not None:
             assert self.mlp_norm is not None
             # 0-diff (qwen35-0diff-lite): vLLM post-attention norm contract
-            # (flashinfer Gemma fused add+RMSNorm on the fp32 sum), TP=1 only.
-            if _GDN_HAS_FI_NORM and self.ps.tp_size == 1 and not _NATIVE_MODE:
-                y, residual = _vllm_pair_norm(
-                    h, residual, self.mlp_norm.weight, self._norm_eps
-                )
+            # (flashinfer Gemma fused add+RMSNorm on the fp32 sum; the fused
+            # AR variant at TP>1 — see fused_ar_norm).
+            if (
+                _GDN_HAS_FI_NORM
+                and (self.ps.tp_size == 1 or self._vllm_tp_contract)
+                and not _NATIVE_MODE
+            ):
+                if self._vllm_tp_contract and residual is not None:
+                    y, residual = vllm_fused_ar_norm(
+                        h, residual, self.mlp_norm.weight, self._norm_eps
+                    )
+                else:
+                    y, residual = _vllm_pair_norm(
+                        h, residual, self.mlp_norm.weight, self._norm_eps
+                    )
                 return self.moe(y), residual
             xs = h if residual is None else residual + h
             return self.moe(self.mlp_norm(xs)), xs
@@ -767,6 +905,36 @@ class Qwen35Model(nn.Module):
         self.config = config
         self.train_config = train_config
         self.ps = ps
+        # 0-diff (qwen35-0diff-epcp): plain-TP deferred-AR contract.  At
+        # TP>1 (contracts on) build vLLM's in-process TP state FIRST so the
+        # fused AR+Gemma-norm sync points and the per-module gates (which
+        # read fused_ar_norm.tp_contract_active) see it armed.  Pure-TP
+        # meshes only (tp == world): vLLM builds its TP group from the world
+        # in rank order, which matches the trainer's tp group exactly there;
+        # CP/EP x TP compositions are out of the contract window for now.
+        self._vllm_tp_contract = False
+        if ps.tp_size > 1 and not _NATIVE_MODE:
+            if dist.is_initialized():
+                if dist.get_world_size() != ps.tp_size:
+                    raise NotImplementedError(
+                        "The vLLM plain-TP contract currently supports pure-TP meshes "
+                        f"(tp == world_size); got tp={ps.tp_size}, "
+                        f"world={dist.get_world_size()}."
+                    )
+                local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+                if not vllm_fused_ar_norm_available() or not ensure_vllm_tp_state(
+                    ps.tp_size, dist.get_rank(), local_rank
+                ):
+                    raise RuntimeError(
+                        "TP>1 with contracts on requires the vLLM fused AR+norm op "
+                        "and in-process vLLM TP state (ensure_vllm_tp_state failed)."
+                    )
+                self._vllm_tp_contract = True
+            else:
+                # Construction without distributed init (meta/CPU tests):
+                # layers still build; the per-forward gates stay off until
+                # ensure_vllm_tp_state runs.
+                pass
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
@@ -803,6 +971,7 @@ class Qwen35Model(nn.Module):
                     use_thd=use_thd,
                     deterministic=getattr(train_config, "deterministic", False),
                     gdn_cp_mode=gdn_cp_mode,
+                    vllm_tp_contract=self._vllm_tp_contract,
                 )
                 for idx in self.layer_indices
             ]
@@ -816,8 +985,14 @@ class Qwen35Model(nn.Module):
             )
             self.head = VocabParallelOutput(config.vocab_size, config.hidden_size, ps)
             self._norm_eps = config.rms_norm_eps
+            # 0-diff (qwen35-0diff-epcp): at TP>1 the final norm is the fused
+            # AR+Gemma norm on the LAST layer's MoE partial (the engine's
+            # deferred-AR structure); the plain pair-norm at TP=1 is the
+            # C3-validated contract.
             self._vllm_head_norm_contract = (
-                _GDN_HAS_FI_NORM and ps.tp_size == 1 and not _NATIVE_MODE
+                _GDN_HAS_FI_NORM
+                and (ps.tp_size == 1 or self._vllm_tp_contract)
+                and not _NATIVE_MODE
             )
 
         self.mtp_embed: VocabParallelEmbedding | None = None
@@ -845,6 +1020,7 @@ class Qwen35Model(nn.Module):
                         use_thd=use_thd,
                         deterministic=getattr(train_config, "deterministic", False),
                         gdn_cp_mode=gdn_cp_mode,
+                        vllm_tp_contract=self._vllm_tp_contract,
                     ),
                     detach_encoder=mtp_detach_encoder,
                 )
@@ -856,7 +1032,11 @@ class Qwen35Model(nn.Module):
             )
 
         self.sp_params: list[nn.Parameter] = []
-        if ps.tp_size > 1:
+        if ps.tp_size > 1 and not self._vllm_tp_contract:
+            # 0-diff (qwen35-0diff-epcp): the TP contract's own backward
+            # all-reduces every replicated-param gradient to the TOTAL (dx
+            # ARs in the GEMM/norm/MoE contract Functions) — the native SP
+            # grad hooks would double-count on top and must stay off.
             self.sp_params = _collect_sp_grad_params(self)
 
     def set_input_tensor(self, input_tensor):
@@ -1010,7 +1190,10 @@ class Qwen35Model(nn.Module):
             else nullcontext()
         )
         with fp8_ctx:
-            if self.embed is not None:
+            if self.embed is not None and not self._vllm_tp_contract:
+                # 0-diff (qwen35-0diff-epcp): the TP contract keeps the FULL
+                # replicated token stream on every rank (the engine's
+                # plain-TP structure — no sequence sharding).
                 h = scatter_to_sequence_parallel(h, self.ps)
             # 0-diff (qwen35-0diff-lite): carry the UN-ADDED (h, residual) pair
             # through the stack; each layer's fused norms consume the exact
@@ -1040,9 +1223,17 @@ class Qwen35Model(nn.Module):
                 and residual is not None
                 and h.dtype == torch.bfloat16
             ):
-                hidden_for_head, h_sum = _vllm_pair_norm(
-                    h, residual, self.norm.weight, self._norm_eps
-                )
+                if self._vllm_tp_contract:
+                    # 0-diff (qwen35-0diff-epcp): final norm = fused AR norm
+                    # on the last layer's MoE partial (deferred-AR sync
+                    # point, bitwise vs the engine TP4 dumps).
+                    hidden_for_head, h_sum = vllm_fused_ar_norm(
+                        h, residual, self.norm.weight, self._norm_eps
+                    )
+                else:
+                    hidden_for_head, h_sum = _vllm_pair_norm(
+                        h, residual, self.norm.weight, self._norm_eps
+                    )
                 output["hidden_states"] = h_sum
             else:
                 if residual is not None:
@@ -1097,7 +1288,24 @@ class Qwen35Model(nn.Module):
                 if calculate_entropy:
                     output["entropy"] = entropy.transpose(0, 1).contiguous()
             else:
-                logits = self.head(hidden_for_head)
+                if self._vllm_tp_contract:
+                    # 0-diff (qwen35-0diff-epcp): TP contract head — plain
+                    # column GEMM on the replicated hidden with the per-rank
+                    # vocab shard (engine GEMM shape; backward all-reduces
+                    # dx), then an autograd-aware all-gather + vocab trim to
+                    # the FULL logits every rank consumes (the engine's
+                    # logprob path runs on the gathered logits).
+                    logits_shard = tp_col_linear(
+                        hidden_for_head,
+                        self.head.col.linear.weight,
+                        self.ps.tp_group,
+                    )
+                    logits_full = _AllGatherLastDim.apply(
+                        logits_shard, self.ps.tp_size, self.ps.tp_group
+                    )[..., : self.head.vocab_size]
+                    logits = logits_full
+                else:
+                    logits_shard = logits = self.head(hidden_for_head)
                 # 0-diff (qwen35-0diff-lite): vLLM prompt-logprob contract —
                 # drive the engine's own Triton chunked log-softmax kernel
                 # on the RAW bf16 logits (no temperature; the engine's
@@ -1119,20 +1327,32 @@ class Qwen35Model(nn.Module):
                     output["loss"] = (-log_probs).mean()
                     output["log_probs"] = log_probs.transpose(0, 1).contiguous()
                     if calculate_entropy:
-                        entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
+                        entropy = vocab_parallel_entropy(logits_shard, self.ps.tp_group)
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
                 else:
                     if temperature_value != 1.0:
+                        logits_shard = logits_shard / temperature_value
                         logits = logits / temperature_value
-                    loss = vocab_parallel_cross_entropy(logits, labels_sb, self.ps.tp_group)
+                    loss = vocab_parallel_cross_entropy(logits_shard, labels_sb, self.ps.tp_group)
                     output["loss"] = loss.mean()
                     output["log_probs"] = (-loss).transpose(0, 1).contiguous()
                     if calculate_entropy:
-                        entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
+                        entropy = vocab_parallel_entropy(logits_shard, self.ps.tp_group)
                         output["entropy"] = entropy.transpose(0, 1).contiguous()
         elif self.head is not None:
-            logits = self.head(hidden_for_head)
-            output["logits"] = self.head.gather(logits).transpose(0, 1).contiguous()
+            if self._vllm_tp_contract:
+                logits_shard = tp_col_linear(
+                    hidden_for_head,
+                    self.head.col.linear.weight,
+                    self.ps.tp_group,
+                )
+                logits = _AllGatherLastDim.apply(
+                    logits_shard, self.ps.tp_size, self.ps.tp_group
+                )[..., : self.head.vocab_size]
+            else:
+                logits = self.head(hidden_for_head)
+                logits = self.head.gather(logits)
+            output["logits"] = logits.transpose(0, 1).contiguous()
         return output
 
     def _apply_mtp_loss(

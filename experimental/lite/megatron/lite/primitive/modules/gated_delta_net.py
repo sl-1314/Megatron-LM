@@ -68,6 +68,12 @@ from megatron.lite.primitive.parallel.thd import (
     reconstruct_packed_from_cp_parts,
     split_packed_to_cp_local,
 )
+from megatron.lite.primitive.modules.fused_ar_norm import (
+    tp_all_reduce_,
+    tp_col_linear,
+    tp_contract_active,
+    vllm_fused_ar_norm,
+)
 from megatron.lite.primitive.utils import ensure_divisible
 
 
@@ -343,7 +349,7 @@ if _HAS_TRITON:
         """
 
         @staticmethod
-        def forward(ctx, x, z, w_param, w_raw, eps):
+        def forward(ctx, x, z, w_param, w_raw, eps, tp_group=None):
             num_tokens, width = x.shape
             num_v_heads = width // w_raw.shape[0]
             out = torch.empty_like(x)
@@ -360,6 +366,7 @@ if _HAS_TRITON:
             )
             ctx.save_for_backward(x, z, w_raw)
             ctx.eps = eps
+            ctx.tp_group = tp_group
             return out
 
         @staticmethod
@@ -384,10 +391,16 @@ if _HAS_TRITON:
             dx = A - (rstd * rstd * rstd) * (xf / n) * t
             dz = dyf * (xf * rstd * wf) * (sig * (1.0 + zf * (1.0 - sig)))
             dw = (dyf * (xf * rstd) * s).sum(dim=(0, 1))
+            # 0-diff (qwen35-0diff-epcp): at TP>1 the per-head norm weight is
+            # replicated but only the LOCAL v-heads flow through this rank —
+            # sum the shard contributions across TP (contract only; the
+            # native path relies on the SP grad hooks instead).
+            tp_all_reduce_(dw, ctx.tp_group)
             return (
                 dx.view_as(x).to(x.dtype),
                 dz.view_as(z).to(z.dtype),
                 dw.to(w_raw.dtype),  # STE: d(gamma)/d(zero-centered w) == 1
+                None,
                 None,
                 None,
             )
@@ -399,13 +412,14 @@ def _vllm_gated_norm(
     w_param: torch.Tensor,
     w_raw: torch.Tensor,
     eps: float,
+    tp_group=None,
 ):
     """Bit-exact vLLM fused gated RMSNorm for bf16 ``[..., HV, V]`` x/gate."""
     shape = x.shape
     width = shape[-1] * shape[-2]  # HV * V
     x2 = x.reshape(-1, width).contiguous()
     g2 = gate.reshape(-1, width).contiguous()
-    return _VllmGatedNorm.apply(x2, g2, w_param, w_raw, eps).view(shape)
+    return _VllmGatedNorm.apply(x2, g2, w_param, w_raw, eps, tp_group).view(shape)
 
 
 # 0-diff (qwen35-0diff-lite): vLLM fused input-norm contract ---------------------------
@@ -705,17 +719,42 @@ class GatedDeltaNet(nn.Module):
         # add) with TE's own norm arithmetic: 51% of in_proj outputs diverged
         # on captured data. TP>1 needs the deferred-all-reduce norm variant
         # and a column-sharded gemm — not contract-covered yet.
+        _tpc = self.ps.tp_size > 1 and tp_contract_active()
         if (
             _HAS_FI_NORM
-            and self.ps.tp_size == 1
+            and (self.ps.tp_size == 1 or _tpc)
             and not self._replicate_heads
             and not _NATIVE_MODE
         ):
-            y, residual = _vllm_pair_norm(
-                x, residual, self.in_proj.linear.layer_norm_weight, self._in_norm_eps
-            )
+            # 0-diff (qwen35-0diff-epcp): TP>1 plain-TP deferred-AR contract.
+            # The engine runs the input norm as the fused AR+Gemma-norm sync
+            # point on the PREVIOUS layer's row-parallel partial (validated
+            # bitwise vs the TP4 engine dumps — fused_ar_norm module), and
+            # splits in_proj into TWO GEMMs (qkvz N=qk+v sections, ba N=h)
+            # — mirroring those exact GEMM shapes keeps cuBLAS kernel
+            # selection identical.  L0 (residual=None) keeps the plain norm:
+            # the embedding AR is eager and x is already the full stream.
+            if _tpc and residual is not None:
+                y, residual = vllm_fused_ar_norm(
+                    x, residual,
+                    self.in_proj.linear.layer_norm_weight, self._in_norm_eps,
+                )
+            else:
+                y, residual = _vllm_pair_norm(
+                    x, residual,
+                    self.in_proj.linear.layer_norm_weight, self._in_norm_eps,
+                )
+            y2d = y.reshape(-1, y.shape[-1])
+            w = self.in_proj.linear.weight
+            if _tpc:
+                n_qkvz = 2 * self.qk_dim_local + 2 * self.v_dim_local
+                qkvz = tp_col_linear(y2d, w[:n_qkvz], self.ps.tp_group)
+                ba = tp_col_linear(y2d, w[n_qkvz:], self.ps.tp_group)
+                merged = torch.cat([qkvz, ba], dim=-1)
+            else:
+                merged = F.linear(y2d, w)
             qkvzba = (
-                F.linear(y.reshape(-1, y.shape[-1]), self.in_proj.linear.weight)
+                merged
                 .view(x.shape[0], x.shape[1], -1)
                 .transpose(0, 1)
                 .contiguous()
@@ -854,7 +893,8 @@ class GatedDeltaNet(nn.Module):
                 # zero-centered param — NOT bit-exact.
                 w_raw = (self.norm.weight.detach().float() + 1.0).to(torch.bfloat16)
             out = _vllm_gated_norm(
-                out, gate, self.norm.weight, w_raw, getattr(self.norm, "eps", 1e-6)
+                out, gate, self.norm.weight, w_raw, getattr(self.norm, "eps", 1e-6),
+                tp_group=self.ps.tp_group if _tpc else None,
             )
         else:
             out = self._apply_gated_norm(out, gate)
@@ -875,6 +915,13 @@ class GatedDeltaNet(nn.Module):
                 out = self._headwise_hp2cp(out, cu_seqlens)
             batch, seq_len = out.shape[:2]
         out = out.transpose(0, 1).contiguous()
+        if _tpc:
+            # 0-diff (qwen35-0diff-epcp): plain-TP deferred-AR contract — the
+            # engine's o_proj is row-parallel with the reduce DEFERRED into
+            # the next norm's fused AR.  Plain F.linear on the loader's
+            # column shard: same GEMM shape (partial output, no all-reduce),
+            # local backward (dX local heads, dW the shard's own gradient).
+            return F.linear(out, self.o_proj.linear.weight), residual
         return self.o_proj(out), residual
 
     def _state_parameters_for_tp(self) -> tuple[torch.Tensor, torch.Tensor]:

@@ -131,6 +131,66 @@ def _tp_linear_attn_state(
     return _tp(tensor, ps.tp_rank, ps.tp_size)
 
 
+def _tp_full_attn_qkvg(tensor: torch.Tensor, *, cfg: Qwen35Config, ps: ParallelState):
+    """Shard the merged mcore q/g/k/v weight into the per-rank local layout.
+
+    The merged layout is per-kv-group [q | gate | k | v].  Rank r owns q
+    heads [r*nq_local, (r+1)*nq_local) and kv head r // kv_replicas (kv
+    replicated when num_kv_heads < tp) — the SAME head sets the engine's
+    QKVParallel sharding picks, packed in the mcore per-kv-group order so
+    the contract forward's ``view(n_tok, nkv_local, ...)`` splits correctly
+    (N=2560 at 16q/2kv/tp4 vs a naive chunk's wrong 2304).
+    """
+    nq, nkv, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    tp = ps.tp_size
+    if tp <= 1 or nkv >= tp:
+        return _tp(tensor, ps.tp_rank, tp)
+    nq_local = nq // tp
+    replicas = tp // nkv
+    group = ps.tp_rank // replicas
+    off = (ps.tp_rank % replicas) * nq_local * hd
+    qpg = nq // nkv
+    q_end = qpg * hd
+    hidden = tensor.shape[-1]
+    packed = tensor.reshape(nkv, 2 * q_end + 2 * hd, hidden)
+    return torch.cat(
+        [
+            packed[group, off : off + nq_local * hd],
+            packed[group, q_end + off : q_end + off + nq_local * hd],
+            packed[group, 2 * q_end : 2 * q_end + hd],
+            packed[group, 2 * q_end + hd : 2 * q_end + 2 * hd],
+        ],
+        dim=0,
+    ).contiguous()
+
+
+def _merge_full_attn_qkvg_tp_shards(
+    shards: list[torch.Tensor], *, cfg: Qwen35Config
+) -> torch.Tensor:
+    """Inverse of ``_tp_full_attn_qkvg`` (save/export path)."""
+    nq, nkv, hd = cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
+    tp = len(shards)
+    if tp <= 1 or nkv >= tp:
+        return torch.cat(shards, dim=0).contiguous()
+    nq_local = nq // tp
+    replicas = tp // nkv
+    qpg = nq // nkv
+    q_end = qpg * hd
+    hidden = shards[0].shape[-1]
+    packed = torch.zeros(nkv, 2 * q_end + 2 * hd, hidden, dtype=shards[0].dtype)
+    for r, shard in enumerate(shards):
+        group = r // replicas
+        off = (r % replicas) * nq_local * hd
+        rows = shard.reshape(-1, hidden)
+        packed[group, off : off + nq_local * hd] = rows[: nq_local * hd]
+        packed[group, q_end + off : q_end + off + nq_local * hd] = rows[
+            nq_local * hd : 2 * nq_local * hd
+        ]
+        packed[group, 2 * q_end : 2 * q_end + hd] = rows[2 * nq_local * hd]
+        packed[group, 2 * q_end + hd : 2 * q_end + 2 * hd] = rows[2 * nq_local * hd + 1]
+    return packed.reshape(-1, hidden).contiguous()
+
+
 def _merge_full_attn_qkvg(
     q_gate: torch.Tensor, key: torch.Tensor, value: torch.Tensor, *, cfg: Qwen35Config
 ) -> torch.Tensor:
@@ -452,6 +512,15 @@ class Qwen35WeightSpec:
                 cfg=self.config,
                 ps=ps,
             )
+        if native_name.endswith(".full_attn.qkv.linear.weight") and (
+            ps.tp_size > 1 and os.environ.get("MLITE_VLLM_CONTRACTS", "1") != "0"
+        ):
+            # 0-diff (qwen35-0diff-epcp): per-rank mcore local layout with
+            # KV-head replication — a naive dim-0 chunk slices across the
+            # per-kv-group structure (2304 rows at tp4 instead of 2560).
+            # Contract mode only: native TP keeps the generic chunk so the
+            # te wrapper's uniform out/tp shapes still load.
+            return _tp_full_attn_qkvg(tensor, cfg=self.config, ps=ps)
         if native_name.endswith(".linear_attn.conv1d.weight"):
             return _tp_linear_attn_conv1d(tensor, cfg=self.config, ps=ps)
         if native_name.endswith((".linear_attn.dt_bias", ".linear_attn.A_log")):
@@ -465,6 +534,10 @@ class Qwen35WeightSpec:
             return None
         if native_name.endswith(".linear_attn.in_proj.linear.weight"):
             return _merge_linear_attn_in_proj_tp_shards(
+                _allgather_tp_shards(tensor, ps), cfg=self.config
+            )
+        if native_name.endswith(".full_attn.qkv.linear.weight"):
+            return _merge_full_attn_qkvg_tp_shards(
                 _allgather_tp_shards(tensor, ps), cfg=self.config
             )
         if native_name.endswith(".linear_attn.conv1d.weight"):
@@ -490,6 +563,8 @@ class Qwen35WeightSpec:
     ) -> torch.Tensor | None:
         if native_name.endswith(".linear_attn.in_proj.linear.weight"):
             return _merge_linear_attn_in_proj_tp_shards(shards, cfg=self.config)
+        if native_name.endswith(".full_attn.qkv.linear.weight"):
+            return _merge_full_attn_qkvg_tp_shards(shards, cfg=self.config)
         if native_name.endswith(".linear_attn.conv1d.weight"):
             return _merge_linear_attn_conv1d_tp_shards(shards, cfg=self.config)
         if native_name.endswith((".linear_attn.dt_bias", ".linear_attn.A_log")):

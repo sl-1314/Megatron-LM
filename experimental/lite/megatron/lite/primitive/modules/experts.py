@@ -272,6 +272,79 @@ def vllm_fused_moe_ep(
     return _VllmFusedMoeEP.apply(x, w13, w2, weights, ids, ep_group, ep_rank, n_local)
 
 
+# 0-diff (qwen35-0diff-epcp): TP>1 fused-MoE contract --------------------------
+#
+# The engine's plain-TP MoE shards each expert's INTERMEDIATE dim (w13 per
+# rank = packed [gate_shard; up_shard], w2 = the matching I-column block,
+# router gate replicated) and runs the SAME fused_experts Triton pipeline on
+# the sharded weights with skip_final_all_reduce — the routed partial is
+# combined with the shared partial and the all-reduce is DEFERRED into the
+# next norm's fused AR+Gemma kernel.  Per-rank replay of exactly this call
+# reproduces the engine's captured fused/shared/combined outputs bitwise
+# (scratch/c10_tp_moe_probe.py, C10_TP_MOE_PASS).
+#
+# Backward mirrors _VllmFusedMoe: the torch surrogate runs on the LOCAL
+# shards; dx and the routing-weight grads are this rank's contribution to a
+# replicated input and are all-reduced over TP; expert dW stays local (each
+# shard's grad comes from its own partial alone — the deferred-AR transpose
+# in the following norm's backward already delivers the total dout).
+
+
+class _VllmFusedMoeTP(torch.autograd.Function):
+    """Routed experts at TP>1: bitwise vLLM forward, exact torch backward."""
+
+    @staticmethod
+    def forward(ctx, x, w13, w2, weights, ids, tp_group):
+        fused_experts = _vllm_fused_experts_fn()
+        assert fused_experts is not None
+        out = fused_experts(
+            x,
+            w13,
+            w2,
+            weights.to(torch.float32).contiguous(),
+            ids.to(torch.int32).contiguous(),
+            global_num_experts=w13.shape[0],
+        )
+        ctx.save_for_backward(x, w13, w2, weights, ids)
+        ctx.tp_group = tp_group
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        x, w13, w2, weights, ids = ctx.saved_tensors
+        with torch.enable_grad():
+            x_ = x.detach().requires_grad_(True)
+            w13_ = w13.detach().requires_grad_(True)
+            w2_ = w2.detach().requires_grad_(True)
+            wts_ = weights.detach().float().requires_grad_(True)
+            out_ = _torch_grouped_moe(x_, w13_, w2_, wts_, ids)
+            grads = torch.autograd.grad(out_, (x_, w13_, w2_, wts_), dout)
+        gx = grads[0].contiguous()
+        gw = grads[3].contiguous()
+        # Sum the per-shard contributions to the replicated input and the
+        # replicated router weights (see the block comment above).
+        if ctx.tp_group is not None and dist.get_world_size(ctx.tp_group) > 1:
+            dist.all_reduce(gx, group=ctx.tp_group)
+            dist.all_reduce(gw, group=ctx.tp_group)
+        return gx, grads[1], grads[2], gw.to(weights.dtype), None, None
+
+
+def vllm_fused_moe_tp(
+    x: torch.Tensor,
+    w13: torch.Tensor,
+    w2: torch.Tensor,
+    weights: torch.Tensor,
+    ids: torch.Tensor,
+    tp_group,
+) -> torch.Tensor:
+    """Bit-exact vLLM Triton fused_moe for bf16 [T, K] inputs at TP>1.
+
+    Forward is the engine's per-rank sharded call (no all-reduce — the
+    deferred AR lives in the following norm).  See the module docstring.
+    """
+    return _VllmFusedMoeTP.apply(x, w13, w2, weights, ids, tp_group)
+
+
 @contextmanager
 def _expert_nvtx_range(name: str):
     if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
@@ -325,6 +398,7 @@ class Experts(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        expert_tp_size: int = 1,
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
@@ -332,16 +406,21 @@ class Experts(nn.Module):
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+        # 0-diff (qwen35-0diff-epcp): expert_tp_size > 1 sizes the (bypassed)
+        # te params to the per-rank intermediate shard the TP contract's
+        # loader fills (packed [gate_shard; up_shard] / I-column block);
+        # native TP keeps replicated experts (expert_tp_size=1).
+        expert_shard = ps.etp_size * max(int(expert_tp_size), 1)
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
             config.hidden_size,
-            config.moe_intermediate_size * 2 // ps.etp_size,
+            config.moe_intermediate_size * 2 // expert_shard,
             bias=False,
             params_dtype=torch.bfloat16,
         )
         self.fc2 = te.GroupedLinear(
             self.num_local_experts,
-            config.moe_intermediate_size // ps.etp_size,
+            config.moe_intermediate_size // expert_shard,
             config.hidden_size,
             bias=False,
             params_dtype=torch.bfloat16,
@@ -367,7 +446,12 @@ class Experts(nn.Module):
                 alpha=lora.alpha,
                 dropout=lora.dropout,
             )
-        if ps.tp_size > 1 and ps.ep_size == 1 and ps.etp_size == 1:
+        if (
+            ps.tp_size > 1
+            and ps.ep_size == 1
+            and ps.etp_size == 1
+            and expert_tp_size == 1
+        ):
             tp_group = ps.tp_group
             for module in (self.fc1, self.fc2, self.fc1_lora, self.fc2_lora):
                 if module is None:

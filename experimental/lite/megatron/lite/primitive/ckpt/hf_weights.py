@@ -1193,14 +1193,28 @@ def _load_expert_weight(
     sharded = custom_shard(native_name, tensor, ps) if callable(custom_shard) else None
     if sharded is not None:
         tensor = sharded
-    elif ps.etp_size > 1:
+    else:
+        # 0-diff (qwen35-0diff-epcp): TP>1 with contracts on shards each
+        # expert's INTERMEDIATE dim (fc1 packed [gate_shard; up_shard], fc2
+        # the I-column block) — the engine's MoE TP convention
+        # (C10_TP_MOE_PASS).  Native TP keeps replicated experts (grad-AR
+        # hooks) and only the ETP split applies.
+        tp_contract = (
+            ps.tp_size > 1 and os.environ.get("MLITE_VLLM_CONTRACTS", "1") != "0"
+        )
         tp_info = spec.tp_spec(native_name)
         if tp_info is not None:
             split_d, _ = tp_info
-            if "fc1" in native_name:
-                tensor = split_gate_up(tensor, ps.etp_rank, ps.etp_size)
-            else:
-                tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
+            if tp_contract:
+                if "fc1" in native_name:
+                    tensor = split_gate_up(tensor, ps.tp_rank, ps.tp_size)
+                else:
+                    tensor = split_dim(tensor, ps.tp_rank, ps.tp_size, dim=split_d)
+            if ps.etp_size > 1:
+                if "fc1" in native_name:
+                    tensor = split_gate_up(tensor, ps.etp_rank, ps.etp_size)
+                else:
+                    tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
     converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
     (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
