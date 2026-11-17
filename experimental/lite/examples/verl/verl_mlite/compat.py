@@ -354,7 +354,12 @@ def _patch_verl_vllm_device_uuid() -> bool:
         return False
 
     utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
-    original_get_device_uuid = utils.get_device_uuid
+    original_get_device_uuid = getattr(utils, "get_device_uuid", None)
+    if original_get_device_uuid is None:
+        # verl dropped the device-UUID helper from its vLLM rollout utils;
+        # there is no UUID lookup left to keep on the actor's visible CUDA
+        # device, so the patch is a no-op instead of an AttributeError.
+        return False
     changed = False
     if getattr(original_get_device_uuid, "_verl_mlite_visible_device_patch", False):
         patched_get_device_uuid = original_get_device_uuid
