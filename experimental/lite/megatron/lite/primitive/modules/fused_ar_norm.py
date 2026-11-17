@@ -128,7 +128,14 @@ def ensure_vllm_tp_state(tp_size: int, rank: int, local_rank: int) -> bool:
         # NOTE the caller-side contract that comes with it: NCCL's bf16
         # all-reduce is ROW-ORDER-SENSITIVE (chunk/channel-dependent
         # accumulation with bf16 rounding) — the packed batch must replicate
-        # the engine's per-chunk row layout for bitwise parity.
+        # the engine's per-chunk row layout for bitwise parity.  The engine
+        # side exports that layout per forward via the env-gated
+        # VLLM_BATCH_COMPOSITION_LOG hook (vllm qwen35-0diff-gdn-fla,
+        # gather_batch_req_state — the authoritative batch row order); the
+        # trainer packs from that export.  The engine env must pin
+        # VLLM_ALLREDUCE_USE_SYMM_MEM=0 to match this mirror: mid-size norm
+        # ARs (2-32MB at SM90/tp4) would otherwise be served by the engine's
+        # symm-mem backend, a path this mirror does not drive.
         os.environ.setdefault("VLLM_ALLREDUCE_USE_SYMM_MEM", "0")
         from vllm.distributed.parallel_state import set_custom_all_reduce
 
