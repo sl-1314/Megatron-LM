@@ -1539,6 +1539,7 @@ def export_hf_weights(
                 yield from _flush_dense_bucket()
                 if limit is None:
                     tensor = _gather_expert_etp(gname, tensor, spec, ps)
+                    tensor = _gather_expert_tp_contract(gname, tensor, spec, ps)
                     tensor_bytes = tensor.numel() * tensor.element_size()
                     should_flush = bool(expert_bucket) and (
                         tensor.dtype != expert_bucket[0][1].dtype
@@ -1734,6 +1735,28 @@ def _gather_expert_etp(
                 return gather_gate_up(tensor, ps.etp_size, ps.etp_group)
             return allgather_concat(tensor, ps.etp_size, ps.etp_group, dim=split_d)
     return tensor
+
+
+def _gather_expert_tp_contract(
+    name: str, tensor: torch.Tensor, spec: HFWeights, ps
+) -> torch.Tensor:
+    # 0-diff (qwen35-0diff-epcp): the load path splits each expert's
+    # INTERMEDIATE dim over the TP group whenever contracts are on at
+    # TP>1 (fc1 packed [gate_shard; up_shard], fc2 the I-column block —
+    # the engine's MoE TP convention).  The export must mirror that
+    # split or it writes the per-rank shards (C12-M4 caught this:
+    # gate_up_proj [256, 1024, 2048] exported as [256, 256, 2048]).
+    if ps.tp_size <= 1 or ps.tp_group is None:
+        return tensor
+    if os.environ.get("MLITE_VLLM_CONTRACTS", "1") == "0":
+        return tensor
+    tp_info = spec.tp_spec(name)
+    if tp_info is None:
+        return tensor
+    split_d, _ = tp_info
+    if "fc1" in name:
+        return gather_gate_up(tensor, ps.tp_size, ps.tp_group)
+    return allgather_concat(tensor, ps.tp_size, ps.tp_group, dim=split_d)
 
 
 def stream_export_to_shards(

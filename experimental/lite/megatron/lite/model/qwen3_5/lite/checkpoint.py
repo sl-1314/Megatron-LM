@@ -859,6 +859,16 @@ class Qwen35WeightSpec:
             native_name.endswith(suffix) for suffix in (".linear_attn.conv1d.weight",)
         ):
             return (0, 0)
+        # 0-diff (qwen35-0diff-epcp): the GDN linear-attn head-state params
+        # are TP-contract-sharded on load (shard_for_load ->
+        # _tp_linear_attn_state: head split or replication).  Without a
+        # tp_spec entry the pp=1 export skips the dense TP gather+merge and
+        # writes the per-rank head shard — C12-M4 caught this (A_log [32]
+        # exported as [8]).  (0, 0) routes them through the dense bucket;
+        # merge_dense_shards inverts the split.  Load is unaffected:
+        # shard_for_load takes precedence over tp_spec.
+        if native_name.endswith((".linear_attn.dt_bias", ".linear_attn.A_log")):
+            return (0, 0)
         return None
 
     def is_expert(self, native_name: str) -> bool:
