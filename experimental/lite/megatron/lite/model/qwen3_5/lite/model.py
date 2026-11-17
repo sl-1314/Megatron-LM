@@ -729,6 +729,12 @@ class Qwen35Layer(nn.Module):
         psp_full = PackedSeqParams.from_cu_seqlens(
             cu_real, max_seqlen=_tight_max_seqlen(cu_real)
         )
+        if os.environ.get("MLITE_DEBUG_DTENSOR"):
+            from megatron.lite.primitive.modules.experts import _dt_desc
+            print(f"[DT_DEBUG] tight_layer xg={_dt_desc(xg)} "
+                  f"residual={_dt_desc(residual)} "
+                  f"norm_w={_dt_desc(getattr(self, 'input_norm', None).weight if hasattr(self, 'input_norm') else None)}",
+                  flush=True)
         h, res_out = Qwen35Layer.forward(
             self, xg, position_ids=position_ids,
             packed_seq_params=psp_full, residual=residual,

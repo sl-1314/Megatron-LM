@@ -143,6 +143,14 @@ def vllm_fused_moe(
     x: torch.Tensor, w13: torch.Tensor, w2: torch.Tensor, weights: torch.Tensor, ids: torch.Tensor
 ) -> torch.Tensor:
     """Bit-exact vLLM Triton fused_moe for bf16 [T, K] inputs."""
+    x, w13, w2, weights = (
+        _dt_unwrap(x),
+        _dt_unwrap(w13),
+        _dt_unwrap(w2),
+        _dt_unwrap(weights),
+    )
+    w13 = _dt_param_to_compute_dtype(w13, x.dtype)
+    w2 = _dt_param_to_compute_dtype(w2, x.dtype)
     return _VllmFusedMoe.apply(x, w13, w2, weights, ids)
 
 
@@ -205,11 +213,83 @@ def _vllm_moe_sum(inp: torch.Tensor, out: torch.Tensor) -> None:
     vops.moe_sum(inp, out)
 
 
+def _dt_desc(t):
+    if isinstance(t, torch.distributed.tensor.DTensor):
+        mesh = t.device_mesh
+        return (f"DTensor(placements={t.placements}, "
+                f"mesh={mesh.mesh_dim_names if mesh else None}, "
+                f"mesh_size={mesh.size() if mesh else None}, "
+                f"shape={tuple(t.shape)})")
+    return (
+        f"{type(t).__name__}({tuple(t.shape) if hasattr(t, 'shape') else '?'}, "
+        f"dtype={getattr(t, 'dtype', None)})"
+    )
+
+
+def _dt_param_to_compute_dtype(t: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
+    """Cast an unwrapped FSDP2 param to the contract's compute dtype.
+
+    FSDP2 keeps promoted fp32 master params; the bf16 compute cast normally
+    happens in the owning module's FSDP2 pre-forward hook.  The MoE contract
+    reads the expert weights directly (stack_expert_weights) without calling
+    the child module's forward, so the cast is bypassed and vLLM's Triton
+    kernel asserts on the mixed fp32 weights.  Casting here mirrors the
+    mp_policy semantics (fp32 master -> param_dtype compute); at theta_0 the
+    fp32 values are exactly-bf16 so the cast is a bitwise identity, and the
+    differentiable cast routes grads back to the fp32 master.
+    """
+    return t.to(dtype) if t.dtype != dtype else t
+
+
+def _dt_unwrap(t: torch.Tensor) -> torch.Tensor:
+    """Unwrap FSDP2 DTensor args to plain local tensors for vLLM custom ops.
+
+    vLLM custom ops (torch.ops.vllm.fused_experts) reject mixed
+    Tensor/DTensor arguments.  FSDP2 wraps expert modules over the
+    singleton expert-DP mesh, so their params arrive as type-only DTensors
+    whose to_local() is the identity; to_local() is differentiable, so
+    backward grads still land on the DTensor params for FSDP2's
+    post-backward reduce (see scratch/dt_tolocal_grad_probe.py).
+    A Shard placement on a multi-rank mesh would mean the caller did not
+    pre-shard as the contract requires — fail loudly rather than silently
+    compute on a fraction of the weights.
+    """
+    from torch.distributed.tensor import DTensor, Replicate
+
+    if not isinstance(t, DTensor):
+        return t
+
+    # A size-1 mesh (the FSDP2 expert-DP singleton) holds the full local
+    # tensor under ANY placement — torch.stack of per-expert Shard(0)
+    # params even records the shifted Shard(1) on the stacked [E, o, i]
+    # tensor (stack_expert_weights); to_local() is the identity there.
+    # Only a Shard placement on a multi-rank mesh is a genuinely partial
+    # tensor the contract cannot consume.
+    mesh = t.device_mesh
+    if (
+        mesh is not None
+        and mesh.size() > 1
+        and not all(isinstance(p, Replicate) for p in t.placements)
+    ):
+        raise RuntimeError(
+            f"MoE contract got a DTensor with placements {t.placements} "
+            f"over a {mesh.size()}-rank mesh; expected the full local "
+            "tensor (singleton expert-DP mesh / fwd-time unsharded / "
+            "Replicate). Shard placements must be pre-materialized by the "
+            "caller (see the TP contract, which passes local shards)."
+        )
+    return t.to_local()
+
+
 class _VllmFusedMoeEP(torch.autograd.Function):
     """Routed experts at EP>1: bitwise vLLM forward, exact torch backward."""
 
     @staticmethod
     def forward(ctx, x, w13, w2, weights, ids, ep_group, ep_rank, n_local):
+        if os.environ.get("MLITE_DEBUG_DTENSOR"):
+            print(f"[DT_DEBUG] moe_ep x={_dt_desc(x)} w13={_dt_desc(w13)} "
+                  f"w2={_dt_desc(w2)} w={_dt_desc(weights)} ids={_dt_desc(ids)}",
+                  flush=True)
         fused_experts = _vllm_fused_experts_fn()
         assert fused_experts is not None
         mask = (ids // n_local) == ep_rank
@@ -269,6 +349,17 @@ def vllm_fused_moe_ep(
     n_local: int,
 ) -> torch.Tensor:
     """Bit-exact vLLM Triton fused_moe for bf16 [T, K] inputs at EP>1."""
+    # Unwrap FSDP2 DTensors outside the autograd.Function so the surrogate
+    # backward runs on plain tensors and grads flow back through to_local()
+    # onto the DTensor params.
+    x, w13, w2, weights = (
+        _dt_unwrap(x),
+        _dt_unwrap(w13),
+        _dt_unwrap(w2),
+        _dt_unwrap(weights),
+    )
+    w13 = _dt_param_to_compute_dtype(w13, x.dtype)
+    w2 = _dt_param_to_compute_dtype(w2, x.dtype)
     return _VllmFusedMoeEP.apply(x, w13, w2, weights, ids, ep_group, ep_rank, n_local)
 
 
@@ -342,6 +433,14 @@ def vllm_fused_moe_tp(
     Forward is the engine's per-rank sharded call (no all-reduce — the
     deferred AR lives in the following norm).  See the module docstring.
     """
+    x, w13, w2, weights = (
+        _dt_unwrap(x),
+        _dt_unwrap(w13),
+        _dt_unwrap(w2),
+        _dt_unwrap(weights),
+    )
+    w13 = _dt_param_to_compute_dtype(w13, x.dtype)
+    w2 = _dt_param_to_compute_dtype(w2, x.dtype)
     return _VllmFusedMoeTP.apply(x, w13, w2, weights, ids, tp_group)
 
 

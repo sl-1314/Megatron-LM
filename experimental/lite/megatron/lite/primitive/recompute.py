@@ -238,7 +238,7 @@ class CheckpointFunction(torch.autograd.Function):
 
     @staticmethod
     def forward(
-        ctx: Any, run_function: Callable, preserve_rng_state: bool, *args: torch.Tensor
+        ctx: Any, run_function: Callable, preserve_rng_state: bool, *args: Any
     ) -> Any:
         ctx.run_function = run_function
         ctx.preserve_rng_state = preserve_rng_state
@@ -248,12 +248,18 @@ class CheckpointFunction(torch.autograd.Function):
             ctx.cpu_rng_state = torch.get_rng_state()
             ctx.cuda_rng_state = torch.cuda.get_rng_state()
 
+        # Save tensor inputs for recomputation in backward; non-tensor args
+        # (kwarg values flattened by wrap_checkpoint included) ride on ctx.
+        ctx.tensor_indices = [i for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
+        ctx.non_tensor_args = [
+            (i, a) for i, a in enumerate(args) if not isinstance(a, torch.Tensor)
+        ]
+        ctx.num_args = len(args)
+        ctx.save_for_backward(*[a for a in args if isinstance(a, torch.Tensor)])
+
         # Run forward without gradient tracking — discard intermediate activations.
         with torch.no_grad():
             outputs = run_function(*args)
-
-        # Save inputs for recomputation in backward.
-        ctx.save_for_backward(*args)
         return outputs
 
     @staticmethod
@@ -263,7 +269,20 @@ class CheckpointFunction(torch.autograd.Function):
                 "Checkpointing is not compatible with .grad(), use .backward() instead"
             )
 
-        inputs = ctx.saved_tensors
+        # Rebuild the full arg tuple: saved tensors (detached so the
+        # recomputed graph is rooted at leaves) in their original slots,
+        # non-tensor args restored from ctx.  A graph-connected tensor left
+        # in the closure (the old kwargs path) keeps its original graph, and
+        # the recompute backward then traverses into earlier checkpoint
+        # nodes — backwarding them a second time after their saved tensors
+        # were already freed.
+        tensors = iter(ctx.saved_tensors)
+        inputs: list[Any] = [None] * ctx.num_args
+        for i in ctx.tensor_indices:
+            t = next(tensors)
+            inputs[i] = t.detach().requires_grad_(t.requires_grad)
+        for i, val in ctx.non_tensor_args:
+            inputs[i] = val
 
         # Fork RNG: restore forward-time states, then reset to current after recompute.
         if ctx.preserve_rng_state:
@@ -273,12 +292,8 @@ class CheckpointFunction(torch.autograd.Function):
             torch.cuda.set_rng_state(ctx.cuda_rng_state)
 
         # Recompute forward pass with gradients enabled.
-        detached = tuple(
-            t.detach().requires_grad_(t.requires_grad) if isinstance(t, torch.Tensor) else t
-            for t in inputs
-        )
         with torch.enable_grad():
-            outputs = ctx.run_function(*detached)
+            outputs = ctx.run_function(*inputs)
 
         # Restore RNG states.
         if ctx.preserve_rng_state:
@@ -299,7 +314,7 @@ class CheckpointFunction(torch.autograd.Function):
         if outputs_with_grad:
             torch.autograd.backward(outputs_with_grad, grad_for_outputs)
 
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached)
+        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
         # None for run_function, None for preserve_rng_state, then grads for each input.
         return (None, None) + grads
 
@@ -326,17 +341,26 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
         else:
             _fwd = original_forward
 
-        # CheckpointFunction.apply only accepts positional tensor args.
-        # Wrap kwargs into the function closure.
-        if kwargs:
+        # CheckpointFunction.apply only accepts positional args.  Flatten
+        # kwargs into trailing positional args (rebuilt inside _fn) so that
+        # graph-connected kwarg TENSORS (e.g. the residual stream) are saved
+        # and detached on recompute — a closure-captured residual keeps its
+        # original graph and the recompute backward then traverses into
+        # earlier checkpoint nodes, backwarding them a second time after
+        # their saved tensors were freed.  Non-tensor kwargs ride on ctx.
+        kw_names = tuple(kwargs.keys())
+        kw_vals = tuple(kwargs.values())
+
+        if kw_names:
 
             def _fn(*a):
-                return _fwd(*a, **kwargs)
+                pos, kw_vals_ = a[: len(a) - len(kw_names)], a[len(a) - len(kw_names) :]
+                return _fwd(*pos, **dict(zip(kw_names, kw_vals_, strict=True)))
 
         else:
             _fn = _fwd
 
-        return CheckpointFunction.apply(_fn, preserve_rng_state, *args)
+        return CheckpointFunction.apply(_fn, preserve_rng_state, *args, *kw_vals)
 
     module.forward = _checkpointed_forward
 
