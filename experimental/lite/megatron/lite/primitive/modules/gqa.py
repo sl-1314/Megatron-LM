@@ -7,6 +7,8 @@ Supports sequence parallel, context parallel, and THD (packed sequences).
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
@@ -512,6 +514,56 @@ class GQAttention(nn.Module):
             and _vllm_fa_fns() is not None
         )
 
+    def _native_core_attn_thd(self, q, k, v, psp_kwargs):
+        """Native-path THD core attention call, working around the TE kernel bug.
+
+        0-diff (qwen35-0diff-epcp): TE 2.20.2's cuDNN fused-attention backward
+        is silently wrong for the packed THD layout at head_dim > 128 on SM90:
+        forward is fine (~2e-3), but dQ/dK/dV are garbage (rel ~0.35; fp16 dK
+        NaN) -- repro: outputs/2026-11-10-qwen35-mlite-0diff/scratch/
+        te_thd_bwd_probe.py.  Dense SBHD and head_dim <= 128 are unaffected
+        (te_sbhd_bwd_probe.py).  Qwen3.5 is 16Q/2KV/256d, so every native-path
+        (MLITE_VLLM_CONTRACTS=0) attention hit the broken kernel; the vLLM FA
+        contract path never calls core_attn and is unaffected.  Route these
+        calls through TE's unfused backend: backend (re)selection happens
+        inside DotProductAttention.forward (module-level cache keyed by
+        attention_params), so the scoped env flip is picked up
+        deterministically on every reselection.  NVTE_UNFUSED_ATTN must be
+        flipped too: models constructed with attention_backend_override pin
+        all three env vars ("fused" = FLASH=0/FUSED=1/UNFUSED=0), which
+        would otherwise leave no backend at all.  Unfused is O(T^2) memory --
+        the price of correct gradients on a debug/comparison path.
+        Set MLITE_NATIVE_THD_UNFUSED=0 to re-enable the fused kernel.
+        """
+        if self.head_dim <= 128 or os.environ.get("MLITE_NATIVE_THD_UNFUSED") == "0":
+            return self.core_attn(
+                q,
+                k,
+                v,
+                core_attention_bias_type="no_bias",
+                attn_mask_type="padding_causal",
+                **psp_kwargs,
+            )
+        saved = (os.environ.get("NVTE_FUSED_ATTN"),
+                 os.environ.get("NVTE_UNFUSED_ATTN"))
+        os.environ["NVTE_FUSED_ATTN"] = "0"
+        os.environ["NVTE_UNFUSED_ATTN"] = "1"
+        try:
+            return self.core_attn(
+                q,
+                k,
+                v,
+                core_attention_bias_type="no_bias",
+                attn_mask_type="padding_causal",
+                **psp_kwargs,
+            )
+        finally:
+            for name, value in zip(("NVTE_FUSED_ATTN", "NVTE_UNFUSED_ATTN"), saved):
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
+
     def forward(
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
@@ -590,14 +642,7 @@ class GQAttention(nn.Module):
                 for k in _KEPT_PSP_FIELDS
                 if getattr(packed_seq_params, k, None) is not None
             }
-            attn_out = self.core_attn(
-                q,
-                k,
-                v,
-                core_attention_bias_type="no_bias",
-                attn_mask_type="padding_causal",
-                **psp_kwargs,
-            )
+            attn_out = self._native_core_attn_thd(q, k, v, psp_kwargs)
             attn_out = attn_out.reshape(attn_out.size(0), 1, -1)
         else:
             attn_out = self.core_attn(q, k, v, core_attention_bias_type="no_bias")
