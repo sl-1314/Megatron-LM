@@ -57,11 +57,16 @@ def _vllm_topk_softmax_contract(
     ``exp(l - max) * (1/Z)``, and the final weights are the top-k probabilities
     renormalized by a sequential accumulation over the k-loop order.
 
-    Selection runs on the raw bf16 logits (``torch.topk`` sorted descending):
-    softmax is monotone, so the set agrees with the kernel's top-k on the
-    probabilities; the kernel's equal-probability tie-break (lower expert id
-    wins) empirically matches torch.topk's tie behavior on bf16 logits
-    (verified set-exact on the C3 in-engine captures, 4 layers x 336 tokens).
+    Selection mirrors the kernel exactly (csrc/moe/topk_softmax_kernels.cu):
+    the k-loop argmax compares the post-division fp32 probabilities with
+    strict '>' scans (smallest column first) and a butterfly tie-break where
+    the LOWER expert id wins, so the output slots follow (value descending,
+    id ascending) — a stable descending sort on ``p``.  Ties are frequent
+    (equal bf16 logits collide in fp32; 74/320 rows at theta_2 L0) and the
+    slot order is observable downstream: fused_experts accumulates the k
+    contributions in slot order, so a permuted tie order flips 1 bf16 ulp
+    in the routed output (C13-B theta_2 root cause).  ``torch.topk`` on the
+    bf16 logits breaks ties HIGH-id-first on CUDA and was replaced.
 
     Caveat: ``torch.exp`` on fp32 CUDA is bit-identical to the kernel's
     ``expf`` and plain elementwise add/mul/div round identically, but any
@@ -89,8 +94,13 @@ def _vllm_topk_softmax_contract(
     z = s[:, :1, :].view(num_tokens, 1)
 
     p = e * (1.0 / z)
-    _, topk_indices = torch.topk(logits, k=topk, dim=1, sorted=True)
-    p_sel = torch.gather(p, 1, topk_indices)
+    # kernel clamps NaN/Inf probabilities to 0 before the argmax loop
+    p = torch.where(torch.isnan(p) | torch.isinf(p), torch.zeros_like(p), p)
+    # (value desc, id asc): the kernel's sequential argmax with lower-id
+    # tie-break == stable descending sort over the ascending id lanes
+    topk_p, order = torch.sort(p, dim=-1, descending=True, stable=True)
+    topk_indices = order[..., :topk]
+    p_sel = topk_p[..., :topk]
     sel_sum = p_sel[..., :1].clone()
     for i in range(1, topk):
         sel_sum = sel_sum + p_sel[..., i : i + 1]
