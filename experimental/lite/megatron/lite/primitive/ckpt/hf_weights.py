@@ -10,10 +10,12 @@ Everything needed for HuggingFace safetensors ↔ Megatron Lite model conversion
 
 from __future__ import annotations
 
+import gc
 import json
 import math
 import os
 import re
+import sys
 import warnings
 from collections.abc import Generator, Iterable
 from contextlib import ExitStack
@@ -532,6 +534,9 @@ def allgather_concat(
     return torch.cat(gathered, dim=dim)
 
 
+_STAGED_FLUSH_SEQ = 0
+
+
 def bucketed_all_gather_into_tensor(
     bucket: list[tuple[str, torch.Tensor]],
     *,
@@ -551,6 +556,74 @@ def bucketed_all_gather_into_tensor(
         raise ValueError("bucket tensors must share the same dtype")
     if buffer_max_size_bytes <= 0:
         raise ValueError("buffer_max_size_bytes must be positive")
+    if (
+        device.type == "cpu"
+        and os.environ.get("VERL_MLITE_STAGED_WEIGHT_SYNC") == "1"
+        and torch.cuda.is_available()
+        and torch.cuda.is_initialized()
+    ):
+        # Staged weight sync (run22e/f, engine TP1): with param offload the
+        # export runs with CPU-resident local shards, but NCCL collectives
+        # need device tensors.  H2D-stage just this bucket on the current
+        # device and gather there; returned shard views are CUDA while the
+        # caller's own buffers stay wherever they were (mixed-device
+        # torch._foreach_copy_ / .copy_ handle the D2H side).  Gathered
+        # VALUES are identical, so the received weights are bit-identical.
+        device = torch.device("cuda", torch.cuda.current_device())
+        bucket = [(name, tensor.to(device)) for name, tensor in bucket]
+        global _STAGED_FLUSH_SEQ
+        _STAGED_FLUSH_SEQ += 1
+        dist_rank = dist.get_rank() if dist.is_initialized() else -1
+        if os.environ.get("VERL_MLITE_TRACE_STAGED_SYNC") == "1":
+            # run22h hang forensics: per-rank flush index + numel, so bucket
+            # divergence across EP ranks (mismatched collectives) is visible
+            # in the run log before the 30-min NCCL watchdog fires.
+            print(
+                f"VERL_MLITE_STAGED_FLUSH rank={dist_rank} seq={_STAGED_FLUSH_SEQ} "
+                f"numel={sum(t.numel() for _, t in bucket)} tensors={len(bucket)}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if os.environ.get("VERL_MLITE_EXPORT_CENSUS") == "1" and _STAGED_FLUSH_SEQ % 128 == 0:
+            # run22k forensics: the sync phase adds ~12G/rank of host RSS that
+            # the post-boundary census cannot attribute (it runs after the
+            # staging is freed).  Sample the live CPU storages mid-export,
+            # every 128th flush, so the peak's owner is named in-flight.
+            _seen = set()
+            _total = 0
+            _tops = []
+            for _o in gc.get_objects():
+                if not isinstance(_o, torch.Tensor):
+                    continue
+                try:
+                    _st = _o.untyped_storage()
+                except Exception:
+                    continue
+                _key = id(_st)
+                if (
+                    _key in _seen
+                    or _st.device.type != "cpu"
+                    or _st.nbytes() == 0
+                ):
+                    continue
+                _seen.add(_key)
+                _nb = _st.nbytes()
+                _total += _nb
+                _tops.append((_nb, str(_o.dtype), str(tuple(_o.shape))))
+            print(
+                f"VERL_MLITE_EXPORT_CENSUS rank={dist_rank} seq={_STAGED_FLUSH_SEQ} "
+                f"cpu_storages={len(_seen)} cpu_bytes={_total / 2**30:.1f}G "
+                f"cuda_alloc={torch.cuda.memory_allocated() / 2**30:.1f}G",
+                file=sys.stderr,
+                flush=True,
+            )
+            for _nb, _dt, _shp in sorted(_tops, reverse=True)[:10]:
+                print(
+                    f"  EXPORT_TOPSTORAGE rank={dist_rank} {_nb / 2**30:.2f}G {_dt} {_shp}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            del _seen, _tops
 
     element_size = bucket[0][1].element_size()
     per_rank_buffer_bytes = max(buffer_max_size_bytes // group_size, element_size)

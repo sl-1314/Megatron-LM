@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import faulthandler
 import gc
 import importlib.abc
 import importlib.machinery
@@ -1129,6 +1130,14 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
         free_slots = None
         ready_results = None
         held_slot = None
+        # run22h: the engine-TP1 initial sync hung for 30 min with ranks 0/1
+        # inside the EP-flush all_gather and ranks 2/3 "no active collectives"
+        # -- Python-side stall somewhere in this producer/consumer/receiver
+        # pipeline.  Periodic all-thread stack dumps (env-gated) name the exact
+        # wait point per rank instead of waiting for the NCCL watchdog.
+        dump_stacks = os.environ.get("VERL_MLITE_TRACE_SYNC_THREADS") == "1"
+        if dump_stacks:
+            faulthandler.dump_traceback_later(30, repeat=True)
         try:
             self._init_socket()
             self._init_buffer()
@@ -1217,6 +1226,8 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                     break
         finally:
             stop.set()
+            if dump_stacks:
+                faulthandler.cancel_dump_traceback_later()
             if held_slot is not None and free_slots is not None:
                 try:
                     free_slots.put_nowait(held_slot)

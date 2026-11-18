@@ -22,6 +22,97 @@ from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
 
 
+def _host_avail_gib() -> float:
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return -1.0
+
+
+def _host_rss_gib() -> float:
+    try:
+        with open("/proc/self/status") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 2**20
+    except OSError:
+        pass
+    return -1.0
+
+
+def _malloc_trim() -> None:
+    """Return glibc's free arena pages to the OS (best effort per boundary)."""
+    try:
+        import ctypes
+
+        ctypes.CDLL("libc.so.6").malloc_trim(ctypes.c_size_t(0))
+    except Exception:
+        pass
+
+
+def _host_tensor_census() -> str:
+    """One-line RSS receipt: live CPU torch tensors bucketed by origin guess.
+
+    Buckets are heuristic ownership labels (param-like / optimizer-state-like /
+    other), sized via ``t.untyped_storage()`` so DTensor local shards count
+    once; freed storages that only the CUDA allocator maps are excluded by
+    device.  Cheap enough for a boundary print; not a profiler.
+    """
+    seen = set()
+    buckets = {"param_like": 0, "big": 0, "small": 0}
+    by_dtype: dict[str, int] = {}
+    tops: list[tuple[int, str, str]] = []
+    n = 0
+    for obj in gc.get_objects():
+        # isinstance (not type-is): nn.Parameter subclass instances count as
+        # param_like buckets; plain tensors bucket by size/grad state.
+        if not isinstance(obj, torch.Tensor):
+            continue
+        try:
+            st = obj.untyped_storage()
+        except Exception:
+            continue
+        key = id(st)
+        if key in seen or st.device.type != "cpu" or st.nbytes() == 0:
+            continue
+        seen.add(key)
+        nbytes = st.nbytes()
+        n += 1
+        by_dtype[str(obj.dtype)] = by_dtype.get(str(obj.dtype), 0) + nbytes
+        if os.environ.get("VERL_MLITE_HOST_TENSOR_TOPS") == "1":
+            # run22k forensics: the 129G "small" bucket at the init boundary
+            # and the ~+12G/rank sync-phase retention need owners.  Keep one
+            # (size, dtype, shape) per storage and print the biggest ones.
+            tops.append((nbytes, str(obj.dtype), str(tuple(obj.shape))))
+        if obj.requires_grad or obj.grad_fn is None and nbytes > 2**30:
+            buckets["param_like"] += nbytes
+        elif nbytes > 2**30:
+            buckets["big"] += nbytes
+        else:
+            buckets["small"] += nbytes
+    rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else -1
+    line = (
+        f"VERL_MLITE_HOST_TENSOR_TRACE rank={rank} storages={n} "
+        f"param_like={buckets['param_like'] / 2**30:.1f}G "
+        f"big={buckets['big'] / 2**30:.1f}G "
+        f"small={buckets['small'] / 2**30:.1f}G "
+        f"rss={_host_rss_gib():.1f}G"
+    )
+    if os.environ.get("VERL_MLITE_HOST_TENSOR_TOPS") == "1":
+        hist = " ".join(
+            f"{k}={v / 2**30:.1f}G"
+            for k, v in sorted(by_dtype.items(), key=lambda kv: -kv[1])[:6]
+        )
+        line += f" dtype[{hist}]"
+        for nbytes, dtype, shape in sorted(tops, reverse=True)[:15]:
+            line += f"\n  TOPSTORAGE rank={rank} {nbytes / 2**30:.2f}G {dtype} {shape}"
+    return line
+
+
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     """Construct typed impl config, backfilling hf_path + optimizer_config."""
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
@@ -472,6 +563,14 @@ class MegatronLiteRuntime(RuntimeBase):
                 # allocator to return their now-unused blocks.
                 gc.collect()
                 torch.cuda.empty_cache()
+                if os.environ.get("VERL_MLITE_MALLOC_TRIM") == "1":
+                    # run22c/run22d host-RAM receipts: tensor census stays flat
+                    # across phase cycles while RSS climbs monotonically --
+                    # freed phase-transient heap (weight-sync serialization,
+                    # offload staging) is retained by glibc as RSS.  Return the
+                    # free arena pages to the OS at every boundary so the
+                    # colocated 784G-host budget sees the real live set.
+                    _malloc_trim()
                 if os.environ.get("VERL_MLITE_TRACE_GPU_MEM") == "1":
                     free_b, total_b = torch.cuda.mem_get_info()
                     print(
@@ -480,10 +579,18 @@ class MegatronLiteRuntime(RuntimeBase):
                         f" driver_free={free_b / 2**30:.1f}G"
                         f" driver_total={total_b / 2**30:.1f}G"
                         f" torch_alloc={torch.cuda.memory_allocated() / 2**30:.1f}G"
-                        f" torch_reserved={torch.cuda.memory_reserved() / 2**30:.1f}G",
+                        f" torch_reserved={torch.cuda.memory_reserved() / 2**30:.1f}G"
+                        f" host_rss={_host_rss_gib():.1f}G"
+                        f" host_avail={_host_avail_gib():.1f}G",
                         file=sys.stderr,
                         flush=True,
                     )
+                if os.environ.get("VERL_MLITE_TRACE_HOST_MEM") == "1":
+                    # Host-RAM receipts for colocated budgeting: census live
+                    # CPU-resident tensors by owner bucket so a Ray host OOM
+                    # attributes to params/optimizer/export-scratch instead
+                    # of guesswork.
+                    print(_host_tensor_census(), file=sys.stderr, flush=True)
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)

@@ -375,7 +375,16 @@ class MegatronLiteEngine(BaseEngine):
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
-        if self.is_param_offload_enabled:
+        # run22e/f (engine TP1): the colocated post-train sync wakes the rollout
+        # engine first (~69G weights) and THEN this export used to whole-module
+        # `to("cuda")` another ~65G of params onto the same card, so the sender's
+        # 2G IPC staging buffer alloc failed with the card at 138.3G used.  In
+        # staged mode the params stay on CPU and only each gather bucket is H2D
+        # staged (VERL_MLITE_STAGED_WEIGHT_SYNC gate in
+        # megatron/lite/primitive/ckpt/hf_weights.py); values and dtypes are
+        # unchanged, so the engine still receives identical bytes.
+        staged_sync = os.environ.get("VERL_MLITE_STAGED_WEIGHT_SYNC") == "1"
+        if self.is_param_offload_enabled and not staged_sync:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
             aggressive_empty_cache(force_sync=True)
