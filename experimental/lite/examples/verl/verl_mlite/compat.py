@@ -354,7 +354,9 @@ def _patch_verl_vllm_device_uuid() -> bool:
         return False
 
     utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
-    original_get_device_uuid = utils.get_device_uuid
+    original_get_device_uuid = getattr(utils, "get_device_uuid", None)
+    if original_get_device_uuid is None:
+        return False
     changed = False
     if getattr(original_get_device_uuid, "_verl_mlite_visible_device_patch", False):
         patched_get_device_uuid = original_get_device_uuid
@@ -1342,6 +1344,49 @@ def _patch_bucketed_weight_sender() -> bool:
     return changed
 
 
+def _patch_verl_qat_mapping_config() -> bool:
+    """Adapt MegatronLiteEngineConfig.qat dict to verl's attribute-style qat_config."""
+    try:
+        pkg = importlib.import_module("verl.utils.qat")
+        sub = importlib.import_module("verl.utils.qat.compressed_tensors")
+    except Exception:
+        return False
+
+    orig = getattr(sub, "dispatch_rollout_weight_quantizer", None)
+    if orig is None:
+        return False
+    if getattr(orig, "_mlite_qat_shim", False):
+        wrapper = orig
+        changed = False
+    else:
+        from collections.abc import Mapping
+        from types import SimpleNamespace
+
+        @wraps(orig)
+        def wrapper(*args, **kwargs):
+            qc = kwargs.get("qat_config")
+            if isinstance(qc, Mapping):
+                kwargs["qat_config"] = SimpleNamespace(
+                    enable=bool(qc.get("enable", qc.get("enabled", False))),
+                    mode=qc.get("mode"),
+                    **{k: v for k, v in qc.items() if k not in ("enable", "mode")},
+                )
+            return orig(*args, **kwargs)
+
+        wrapper._mlite_qat_shim = True
+        sub.dispatch_rollout_weight_quantizer = wrapper
+        changed = True
+
+    if getattr(pkg, "dispatch_rollout_weight_quantizer", None) is not wrapper:
+        pkg.dispatch_rollout_weight_quantizer = wrapper
+        changed = True
+    ew = sys.modules.get("verl.workers.engine_workers")
+    if ew is not None and getattr(ew, "dispatch_rollout_weight_quantizer", None) is not wrapper:
+        ew.dispatch_rollout_weight_quantizer = wrapper
+        changed = True
+    return changed
+
+
 def apply_runtime_patches() -> None:
     _trace_runtime_patch("00.begin")
     result = _patch_transformers_vision2seq_alias()
@@ -1368,6 +1413,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
     result = _patch_verl_dsv4_native_layerwise_reload()
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
+    result = _patch_verl_qat_mapping_config()
+    _trace_runtime_patch("08d.verl_qat_mapping_config", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")

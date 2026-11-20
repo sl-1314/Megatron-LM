@@ -18,6 +18,7 @@ from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.model.qwen3_5.config import Qwen35Config
 from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
 from megatron.lite.primitive.modules.experts import Experts, swiglu_with_probs
+from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
 from megatron.lite.primitive.modules.gqa import GQAttention as FullAttention
 from megatron.lite.primitive.modules.gqa import split_grouped_qkvg as _split_grouped_qkvg
@@ -82,9 +83,12 @@ def _qwen_mrope_section(config: Qwen35Config) -> list[int]:
 
 
 class DenseMLP(nn.Module):
-    def __init__(self, config: Qwen35Config, ps: ParallelState):
+    def __init__(self, config: Qwen35Config, ps: ParallelState, *, bi_mode: bool = False):
         super().__init__()
         assert config.intermediate_size is not None
+        self.bi_mode = bool(bi_mode)
+        self.rms_norm_eps = float(config.rms_norm_eps)
+        self.ps = ps
         self.gate_up = ColumnParallelLinear(
             config.hidden_size,
             config.intermediate_size * 2,
@@ -98,7 +102,37 @@ class DenseMLP(nn.Module):
             config.intermediate_size, config.hidden_size, ps, bias=False
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        residual: torch.Tensor | None = None,
+        return_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.bi_mode:
+            from megatron.lite.model.qwen3_5.lite.bi_ops import (
+                bi_fused_add_gemma_rms_norm,
+                bi_gemma_rms_norm,
+                bi_linear,
+                bi_silu_and_mul,
+            )
+
+            assert self.ps.tp_size == 1
+            ln_w = self.gate_up.linear.layer_norm_weight
+            if residual is None:
+                res_out = x
+                x_norm = bi_gemma_rms_norm(x, ln_w, eps=self.rms_norm_eps)
+            else:
+                x_norm, res_out = bi_fused_add_gemma_rms_norm(
+                    x, residual, ln_w, eps=self.rms_norm_eps
+                )
+            out = bi_linear(
+                bi_silu_and_mul(bi_linear(x_norm, self.gate_up.linear.weight)),
+                self.down.linear.weight,
+            )
+            if return_residual:
+                return out, res_out
+            return out
         return self.down(_swiglu(self.gate_up(x)))
 
 
@@ -136,9 +170,15 @@ class SharedExpert(nn.Module):
             return self.linear(x)
 
     def __init__(
-        self, config: Qwen35Config, ps: ParallelState, *, use_plain_te_linear: bool = False
+        self,
+        config: Qwen35Config,
+        ps: ParallelState,
+        *,
+        use_plain_te_linear: bool = False,
+        bi_mode: bool = False,
     ):
         super().__init__()
+        self.bi_mode = bool(bi_mode)
         ffn = config.shared_expert_intermediate_size
         if use_plain_te_linear and ps.tp_size == 1:
             self.gate_up = self._PlainTELinear(config.hidden_size, ffn * 2)
@@ -163,6 +203,14 @@ class SharedExpert(nn.Module):
             grad_fn._set_sequence_nr(torch.iinfo(torch.int).max)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bi_mode:
+            from megatron.lite.model.qwen3_5.lite.bi_ops import bi_linear, bi_silu_and_mul
+
+            gate_val = torch.sigmoid(bi_linear(x, self.shared_gate.weight))
+            gu = bi_linear(x, self.gate_up.linear.weight)
+            act = bi_silu_and_mul(gu)
+            out = bi_linear(act, self.down.linear.weight)
+            return gate_val * out
         gate_val = self.shared_gate(x).sigmoid()
         fc1_input = x
         if self.use_mcore_overlap_graph:
@@ -188,10 +236,13 @@ class MoELayer(nn.Module):
         preserve_3d_graph: bool = False,
         shared_expert_plain_te: bool = False,
         moe_permute_fusion: bool | None = None,
+        bi_mode: bool = False,
     ):
         super().__init__()
         if fp8:
             raise NotImplementedError("lite qwen35 MoE fp8 is not implemented yet.")
+        self.ps = ps
+        self.bi_mode = bool(bi_mode)
         self.router = TopKRouter(
             config,
             ps,
@@ -199,7 +250,9 @@ class MoELayer(nn.Module):
             compute_aux_loss=True,
             router_dtype=router_dtype,
         )
-        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        self.experts = Experts(
+            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute, bi_mode=bi_mode
+        )
         self.dispatcher = TokenDispatcher(
             config.num_experts,
             config.hidden_size,
@@ -207,10 +260,17 @@ class MoELayer(nn.Module):
             use_deepep=use_deepep,
             moe_permute_fusion=moe_permute_fusion,
         )
-        self.shared_expert = SharedExpert(config, ps, use_plain_te_linear=shared_expert_plain_te)
+        self.shared_expert = SharedExpert(
+            config,
+            ps,
+            use_plain_te_linear=shared_expert_plain_te,
+            bi_mode=bi_mode,
+        )
         self.preserve_3d_graph = bool(preserve_3d_graph)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.bi_mode:
+            return self._forward_bi(x)
         input_shape = x.shape
         x_2d = x.reshape(-1, x.size(-1))
         shared_input = x_2d.view(input_shape) if self.preserve_3d_graph else x_2d
@@ -246,6 +306,77 @@ class MoELayer(nn.Module):
         output += shared_out
         return output.to(x.dtype)
 
+    def _forward_bi(self, x: torch.Tensor) -> torch.Tensor:
+        from megatron.lite.model.qwen3_5.lite.bi_ops import (
+            bi_linear,
+            bi_moe_sum,
+            bi_topk_softmax,
+        )
+
+        if self.ps.tp_size != 1 or self.ps.etp_size != 1:
+            raise NotImplementedError("MoELayer bi_mode requires tp_size=1 and etp_size=1.")
+        input_shape = x.shape
+        x_2d = x.reshape(-1, x.size(-1)).contiguous()
+        shared_out = self.shared_expert(x_2d)
+
+        router_logits = bi_linear(x_2d, self.router.gate.weight)
+        topk_weights, topk_ids = bi_topk_softmax(
+            router_logits, self.router.topk, renormalize=True
+        )
+        n_local = self.experts.num_local_experts
+
+        if self.ps.ep_size <= 1:
+            slots = self.experts(
+                x_2d,
+                None,
+                permuted_probs=topk_weights,
+                bi_topk_ids=topk_ids,
+            )
+            routed_out = bi_moe_sum(slots)
+        else:
+            ep_size = self.ps.ep_size
+            ep_group = self.ps.ep_group
+            T, topk = topk_ids.shape
+            H = x_2d.shape[1]
+            flat_x = x_2d.unsqueeze(1).expand(T, topk, H).reshape(-1, H)
+            flat_ids = topk_ids.reshape(-1)
+            flat_w = topk_weights.reshape(-1)
+            dest_ranks = (flat_ids // n_local).long()
+            perm = torch.argsort(dest_ranks, stable=True)
+            inv_perm = torch.argsort(perm)
+            counts = torch.bincount(dest_ranks[perm], minlength=ep_size)
+            input_splits = counts.tolist()
+            recv_counts = torch.empty_like(counts)
+            dist.all_to_all_single(recv_counts, counts, group=ep_group)
+            output_splits = recv_counts.tolist()
+
+            recv_x = _AllToAll.apply(flat_x[perm], input_splits, output_splits, ep_group)
+            send_local_ids = (flat_ids[perm] % n_local).to(torch.int32).contiguous()
+            recv_local_ids = torch.empty(
+                (sum(output_splits),), dtype=torch.int32, device=x_2d.device
+            )
+            dist.all_to_all_single(
+                recv_local_ids,
+                send_local_ids,
+                output_split_sizes=output_splits,
+                input_split_sizes=input_splits,
+                group=ep_group,
+            )
+            recv_w = _AllToAll.apply(flat_w[perm], input_splits, output_splits, ep_group)
+            recv_out = self.experts(
+                recv_x,
+                None,
+                permuted_probs=None,
+                bi_topk_ids=recv_local_ids.unsqueeze(1),
+                bi_probs_fp32_bits=lambda r=recv_w.unsqueeze(1): r,
+            ).squeeze(1)
+            unperm_out = _AllToAll.apply(recv_out, output_splits, input_splits, ep_group)
+            slots = unperm_out[inv_perm].view(T, topk, H)
+            routed_out = bi_moe_sum(slots)
+
+        output = (shared_out + routed_out).view(input_shape)
+        return output.to(x.dtype)
+
 
 class Qwen35Layer(nn.Module):
     def __init__(
@@ -261,9 +392,12 @@ class Qwen35Layer(nn.Module):
         use_thd: bool = False,
         deterministic: bool = False,
         gdn_cp_mode: str = "headwise",
+        bi_mode: bool = False,
     ):
         super().__init__()
         self.layer_idx = layer_idx
+        self.bi_mode = bool(bi_mode)
+        self.rms_norm_eps = float(config.rms_norm_eps)
         self._layer_type = config.layer_type_at(layer_idx)
         self.full_attn: FullAttention | None = None
         self.linear_attn: GatedDeltaNet | None = None
@@ -282,6 +416,8 @@ class Qwen35Layer(nn.Module):
                 zero_centered_gamma=True,
                 qkv_layout="mcore",
                 mrope_section=_qwen_mrope_section(config),
+                bi_mode=self.bi_mode,
+                max_position_embeddings=config.max_position_embeddings,
             )
         else:
             self.linear_attn = GatedDeltaNet(
@@ -295,6 +431,7 @@ class Qwen35Layer(nn.Module):
                 ps=ps,
                 deterministic=deterministic,
                 cp_mode=gdn_cp_mode,
+                bi_mode=self.bi_mode,
             )
         if config.is_moe:
             self.mlp_norm: nn.Module | None = te.RMSNorm(
@@ -311,16 +448,58 @@ class Qwen35Layer(nn.Module):
                 preserve_3d_graph=deterministic,
                 shared_expert_plain_te=deterministic,
                 moe_permute_fusion=True,
+                bi_mode=self.bi_mode,
             )
             self.mlp: DenseMLP | None = None
         else:
             self.mlp_norm = None
             self.moe = None
-            self.mlp = DenseMLP(config, ps)
+            self.mlp = DenseMLP(config, ps, bi_mode=self.bi_mode)
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        *,
+        residual: torch.Tensor | None = None,
+        return_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.bi_mode:
+            from megatron.lite.model.qwen3_5.lite.bi_ops import (
+                bi_fused_add_gemma_rms_norm,
+            )
+
+            if self.full_attn is not None:
+                h, residual = self.full_attn(
+                    x,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                    residual=residual,
+                    return_residual=True,
+                )
+            else:
+                assert self.linear_attn is not None
+                h, residual = self.linear_attn(
+                    x,
+                    position_ids=position_ids,
+                    packed_seq_params=packed_seq_params,
+                    residual=residual,
+                    return_residual=True,
+                )
+            if self.moe is not None:
+                assert self.mlp_norm is not None
+                h_mlp_in, residual = bi_fused_add_gemma_rms_norm(
+                    h, residual, self.mlp_norm.weight, eps=self.rms_norm_eps
+                )
+                out = self.moe(h_mlp_in)
+            else:
+                assert self.mlp is not None
+                out, residual = self.mlp(h, residual=residual, return_residual=True)
+            if return_residual:
+                return out, residual
+            return (out.to(torch.float32) + residual.to(torch.float32)).to(out.dtype)
+        assert not return_residual
         residual = x
         if self.full_attn is not None:
             h = self.full_attn(x, position_ids=position_ids, packed_seq_params=packed_seq_params)
@@ -399,12 +578,15 @@ class Qwen35Model(nn.Module):
         mtp_detach_encoder: bool = False,
         mount_vision_model: bool = False,
         gdn_cp_mode: str = "headwise",
+        bi_mode: bool = False,
     ):
         super().__init__()
         _apply_attention_backend_override(attention_backend_override)
         self.config = config
         self.train_config = train_config
         self.ps = ps
+        self.bi_mode = bool(bi_mode)
+        self.rms_norm_eps = float(config.rms_norm_eps)
         self.mtp_enable_train = bool(mtp_enable and mtp_enable_train)
         self.mtp_loss_scaling_factor = config.mtp_loss_scaling_factor
         self._input_tensor: torch.Tensor | None = None
@@ -441,6 +623,7 @@ class Qwen35Model(nn.Module):
                     use_thd=use_thd,
                     deterministic=getattr(train_config, "deterministic", False),
                     gdn_cp_mode=gdn_cp_mode,
+                    bi_mode=self.bi_mode,
                 )
                 for idx in self.layer_indices
             ]
@@ -539,12 +722,56 @@ class Qwen35Model(nn.Module):
         with fp8_ctx:
             if self.embed is not None:
                 h = scatter_to_sequence_parallel(h, self.ps)
-            for layer in self.layers:
-                h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
+            if self.bi_mode:
+                residual = None
+                for layer in self.layers:
+                    h, residual = layer(
+                        h,
+                        position_ids=position_ids,
+                        packed_seq_params=packed_seq_params,
+                        residual=residual,
+                        return_residual=True,
+                    )
+            else:
+                for layer in self.layers:
+                    h = layer(h, position_ids=position_ids, packed_seq_params=packed_seq_params)
 
         output = {"hidden_states": h}
         if self.head is not None:
             assert self.norm is not None
+            if self.bi_mode:
+                from megatron.lite.model.qwen3_5.lite.bi_ops import (
+                    bi_fused_add_gemma_rms_norm,
+                    bi_gemma_rms_norm,
+                    bi_linear,
+                    bi_vocab_cross_entropy,
+                )
+
+                assert self.ps.tp_size == 1
+                if residual is None:
+                    hidden_for_head = bi_gemma_rms_norm(
+                        h, self.norm.weight, eps=self.rms_norm_eps
+                    )
+                else:
+                    hidden_for_head, _ = bi_fused_add_gemma_rms_norm(
+                        h, residual, self.norm.weight, eps=self.rms_norm_eps
+                    )
+                if labels is not None:
+                    temperature_value = _temperature_to_float(temperature)
+                    logits = bi_linear(hidden_for_head, self.head.col.linear.weight)
+                    if temperature_value != 1.0:
+                        logits = logits / temperature_value
+                    labels_sb = labels.transpose(0, 1).contiguous()
+                    loss = bi_vocab_cross_entropy(logits, labels_sb)
+                    output["loss"] = loss.mean()
+                    output["log_probs"] = (-loss).transpose(0, 1).contiguous()
+                    if calculate_entropy:
+                        entropy = vocab_parallel_entropy(logits, self.ps.tp_group)
+                        output["entropy"] = entropy.transpose(0, 1).contiguous()
+                else:
+                    logits = bi_linear(hidden_for_head, self.head.col.linear.weight)
+                    output["logits"] = logits.transpose(0, 1).contiguous()
+                return output
             hidden_for_head = self.norm(h)
             if labels is not None:
                 temperature_value = _temperature_to_float(temperature)

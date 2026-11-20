@@ -67,6 +67,8 @@ class GQAttention(nn.Module):
         qkv_layout: str = "flat",
         lora_config: LoraConfig | dict | None = None,
         mrope_section: list[int] | None = None,
+        bi_mode: bool = False,
+        max_position_embeddings: int = 262144,
     ):
         super().__init__()
         self.num_heads_local = ensure_divisible(num_attention_heads, ps.tp_size)
@@ -88,6 +90,10 @@ class GQAttention(nn.Module):
             raise ValueError(f"Unsupported qkv_layout={qkv_layout!r}")
         self._qkv_layout = qkv_layout
         self._mrope_section = list(mrope_section) if mrope_section is not None else None
+        self.bi_mode = bool(bi_mode)
+        self._rope_theta = float(rope_theta)
+        self._rotary_percent = float(rotary_percent)
+        self._max_position_embeddings = int(max_position_embeddings)
 
         # Declaration order follows MC's `SelfAttention` submodule order
         # (linear_proj → linear_qkv → q_layernorm → k_layernorm). `named_
@@ -182,8 +188,23 @@ class GQAttention(nn.Module):
         )
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        *,
+        residual: torch.Tensor | None = None,
+        return_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.bi_mode:
+            return self._forward_bi(
+                x,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                residual=residual,
+                return_residual=return_residual,
+            )
+        assert not return_residual
         qkv = self.qkv(x)
         if self.qkv_lora is not None:
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
@@ -279,6 +300,195 @@ class GQAttention(nn.Module):
         if self.proj_lora is not None:
             output = output + self.proj_lora(attn_out)
         return output
+
+    def _forward_bi(
+        self,
+        x: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        residual: torch.Tensor | None = None,
+        return_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        from megatron.lite.model.qwen3_5.lite.bi_ops import (
+            bi_all_gather_cp,
+            bi_flash_attn_varlen,
+            bi_fused_add_gemma_rms_norm,
+            bi_gemma_rms_norm,
+            bi_linear,
+            bi_qk_rmsnorm_rope_gate,
+            bi_sigmoid_gate_mul,
+            get_vllm_mrope_cache,
+        )
+        from megatron.lite.primitive.parallel.thd import reconstruct_packed_from_cp_parts
+
+        if self.ps.tp_size != 1:
+            raise NotImplementedError("GQAttention bi_mode currently requires tp_size=1.")
+        if self.qkv_lora is not None or self.proj_lora is not None:
+            raise NotImplementedError("GQAttention bi_mode does not support LoRA.")
+        assert self._output_gate and self._mrope_section is not None
+        assert position_ids is not None
+
+        ln_w = self.qkv.linear.layer_norm_weight
+        if residual is None:
+            residual_out = x
+            x_norm = bi_gemma_rms_norm(x, ln_w, eps=self._qkv_eps)
+        else:
+            x_norm, residual_out = bi_fused_add_gemma_rms_norm(
+                x, residual, ln_w, eps=self._qkv_eps
+            )
+
+        qkv = bi_linear(x_norm, self.qkv.linear.weight)
+        q, gate, k, v = self._split_qkv(qkv)
+
+        is_thd = packed_seq_params is not None
+        if is_thd:
+            # x: [T_local, 1, H] -> q, gate, k, v: [T_local, 1, heads, D]
+            S_local, B = q.shape[0], q.shape[1]
+            assert B == 1
+            T_local = S_local
+            q_gate = torch.cat([q.squeeze(1), gate.squeeze(1)], dim=-1).reshape(
+                T_local, self.num_heads_local * 2 * self.head_dim
+            )
+            k_flat = k.squeeze(1).reshape(
+                T_local, self.num_kv_heads_local * self.head_dim
+            )
+            v_3d = v.squeeze(1)
+            pos_3t = position_ids.reshape(3, T_local).contiguous()
+        else:
+            # x: [S_local, B, H] -> transpose to [B, S_local, ...]
+            S_local, B = q.shape[0], q.shape[1]
+            T_local = B * S_local
+            q_gate = (
+                torch.cat([q, gate], dim=-1)
+                .transpose(0, 1)
+                .reshape(T_local, self.num_heads_local * 2 * self.head_dim)
+            )
+            k_flat = (
+                k.transpose(0, 1)
+                .reshape(T_local, self.num_kv_heads_local * self.head_dim)
+            )
+            v_3d = v.transpose(0, 1).reshape(
+                T_local, self.num_kv_heads_local, self.head_dim
+            )
+            pos_3t = position_ids.reshape(3, T_local).contiguous()
+
+        cos_sin_cache, rotary_dim, mrope_section = get_vllm_mrope_cache(
+            self.head_dim,
+            self._max_position_embeddings,
+            self._rope_theta,
+            self._rotary_percent,
+            tuple(self._mrope_section),
+            str(x.device),
+        )
+        q_rot, k_rot, g_out = bi_qk_rmsnorm_rope_gate(
+            q_gate,
+            k_flat,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos_sin_cache,
+            pos_3t,
+            self._qkv_eps,
+            self.num_heads_local,
+            self.num_kv_heads_local,
+            self.head_dim,
+            rotary_dim,
+            mrope_section,
+        )
+        q_3d = q_rot.view(T_local, self.num_heads_local, self.head_dim)
+        k_3d = k_rot.view(T_local, self.num_kv_heads_local, self.head_dim)
+        scale = self.head_dim**-0.5
+
+        if self.ps.cp_size == 1:
+            if is_thd:
+                cu = packed_seq_params.cu_seqlens_q.to(
+                    dtype=torch.int32, device=x.device
+                )
+                max_q = int(packed_seq_params.max_seqlen_q)
+            else:
+                cu = (
+                    torch.arange(B + 1, dtype=torch.int32, device=x.device)
+                    * S_local
+                )
+                max_q = S_local
+            attn_out = bi_flash_attn_varlen(
+                q_3d, k_3d, v_3d, cu, cu, max_q, max_q, scale
+            )
+        else:
+            if not is_thd:
+                raise NotImplementedError(
+                    "GQAttention bi_mode CP>1 requires THD packed inputs."
+                )
+            cp_size = self.ps.cp_size
+            cp_rank = self.ps.cp_rank
+            cu_global = (
+                packed_seq_params.cu_seqlens_q_padded
+                if getattr(packed_seq_params, "cu_seqlens_q_padded", None) is not None
+                else packed_seq_params.cu_seqlens_q
+            )
+            k_parts = bi_all_gather_cp(k_3d, self.ps.cp_group)
+            v_parts = bi_all_gather_cp(v_3d, self.ps.cp_group)
+            k_global = reconstruct_packed_from_cp_parts(
+                k_parts, cu_seqlens_padded=cu_global, cp_size=cp_size, dim=0
+            )
+            v_global = reconstruct_packed_from_cp_parts(
+                v_parts, cu_seqlens_padded=cu_global, cp_size=cp_size, dim=0
+            )
+            cu_list = cu_global.tolist()
+            q_lens = []
+            k_lens = []
+            kv_indices = []
+            for s, e in zip(cu_list[:-1], cu_list[1:]):
+                seq_len = e - s
+                if seq_len <= 0:
+                    continue
+                chunk = seq_len // (2 * cp_size)
+                # Chunk 0: [s + cp_rank*chunk, s + (cp_rank+1)*chunk) -> prefix [s, s + (cp_rank+1)*chunk)
+                k0_len = (cp_rank + 1) * chunk
+                q_lens.append(chunk)
+                k_lens.append(k0_len)
+                kv_indices.append(
+                    torch.arange(s, s + k0_len, dtype=torch.int64, device=x.device)
+                )
+                # Chunk 1: [e - (cp_rank+1)*chunk, e - cp_rank*chunk) -> prefix [s, e - cp_rank*chunk)
+                k1_len = seq_len - cp_rank * chunk
+                q_lens.append(chunk)
+                k_lens.append(k1_len)
+                kv_indices.append(
+                    torch.arange(s, s + k1_len, dtype=torch.int64, device=x.device)
+                )
+            cu_q = torch.zeros(len(q_lens) + 1, dtype=torch.int32, device=x.device)
+            cu_q[1:] = torch.tensor(q_lens, dtype=torch.int32, device=x.device).cumsum(0)
+            cu_k = torch.zeros(len(k_lens) + 1, dtype=torch.int32, device=x.device)
+            cu_k[1:] = torch.tensor(k_lens, dtype=torch.int32, device=x.device).cumsum(0)
+            kv_idx = torch.cat(kv_indices, dim=0)
+            k_chunks = k_global[kv_idx]
+            v_chunks = v_global[kv_idx]
+            attn_out = bi_flash_attn_varlen(
+                q_3d,
+                k_chunks,
+                v_chunks,
+                cu_q,
+                cu_k,
+                max(q_lens),
+                max(k_lens),
+                scale,
+            )
+
+        attn_out_2d = attn_out.reshape(
+            T_local, self.num_heads_local * self.head_dim
+        )
+        attn_out_2d = bi_sigmoid_gate_mul(attn_out_2d, g_out)
+        if is_thd:
+            attn_out_sb = attn_out_2d.unsqueeze(1)
+        else:
+            attn_out_sb = attn_out_2d.reshape(
+                B, S_local, self.num_heads_local * self.head_dim
+            ).transpose(0, 1).contiguous()
+        out = bi_linear(attn_out_sb, self.proj.linear.weight)
+        if return_residual:
+            return out, residual_out
+        return out
 
     def _qkv_lora_input(self, x: torch.Tensor) -> torch.Tensor:
         linear = self.qkv.linear

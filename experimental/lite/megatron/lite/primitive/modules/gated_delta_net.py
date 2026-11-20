@@ -120,6 +120,7 @@ class GatedDeltaNet(nn.Module):
         ps: ParallelState,
         deterministic: bool = False,
         cp_mode: str = "headwise",
+        bi_mode: bool = False,
     ):
         super().__init__()
         if cp_mode not in _CP_MODES:
@@ -129,6 +130,8 @@ class GatedDeltaNet(nn.Module):
         self.ps = ps
         self.deterministic = bool(deterministic)
         self.cp_mode = cp_mode
+        self.bi_mode = bool(bi_mode)
+        self.rms_norm_eps = float(rms_norm_eps)
         self.num_k_heads = linear_num_key_heads
         self.num_v_heads = linear_num_value_heads
         self.dk = linear_key_head_dim
@@ -234,8 +237,23 @@ class GatedDeltaNet(nn.Module):
         return [self.qk_dim_local, self.qk_dim_local, self.v_dim_local]
 
     def forward(
-        self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
-    ) -> torch.Tensor:
+        self,
+        x: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        *,
+        residual: torch.Tensor | None = None,
+        return_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        if self.bi_mode:
+            return self._forward_bi(
+                x,
+                position_ids=position_ids,
+                packed_seq_params=packed_seq_params,
+                residual=residual,
+                return_residual=return_residual,
+            )
+        assert not return_residual
         del position_ids
         is_packed = packed_seq_params is not None
         qkvzba = self.in_proj(x).transpose(0, 1).contiguous()
@@ -355,6 +373,123 @@ class GatedDeltaNet(nn.Module):
             batch, seq_len = out.shape[:2]
         out = out.transpose(0, 1).contiguous()
         return self.o_proj(out)
+
+    def _forward_bi(
+        self,
+        x: torch.Tensor,
+        *,
+        position_ids: torch.Tensor | None = None,
+        packed_seq_params=None,
+        residual: torch.Tensor | None = None,
+        return_residual: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
+        del position_ids
+        from megatron.lite.model.qwen3_5.lite.bi_ops import (
+            bi_causal_conv1d,
+            bi_fused_add_gemma_rms_norm,
+            bi_fused_gdn,
+            bi_gemma_rms_norm,
+            bi_linear,
+            bi_rms_norm_gated,
+        )
+
+        if self.ps.tp_size != 1:
+            raise NotImplementedError(
+                "GatedDeltaNet bi_mode currently requires tp_size=1."
+            )
+
+        ln_w = self.in_proj.linear.layer_norm_weight
+        if residual is None:
+            residual_out = x
+            x_norm = bi_gemma_rms_norm(x, ln_w, eps=self.rms_norm_eps)
+        else:
+            x_norm, residual_out = bi_fused_add_gemma_rms_norm(
+                x, residual, ln_w, eps=self.rms_norm_eps
+            )
+
+        qkvz_dim = self.qk_dim * 2 + self.v_dim * 2
+        ba_dim = self.num_v_heads * 2
+        w_qkvz, w_ba = self.in_proj.linear.weight.split([qkvz_dim, ba_dim], dim=0)
+        qkvz = bi_linear(x_norm, w_qkvz.contiguous()).transpose(0, 1).contiguous()
+        ba = bi_linear(x_norm, w_ba.contiguous()).transpose(0, 1).contiguous()
+        qkvzba = torch.cat([qkvz, ba], dim=-1)
+
+        is_packed = packed_seq_params is not None
+        cu_seqlens = self._packed_cu_seqlens(packed_seq_params) if is_packed else None
+
+        headwise = False
+        cp_div = 1
+        if self.ps.cp_size > 1:
+            if self.ps.cp_group is None:
+                raise RuntimeError("CP>1 requires ParallelState.cp_group.")
+            if not is_packed and qkvzba.shape[0] > 1:
+                raise ValueError(
+                    "GatedDeltaNet headwise CP with SBHD inputs currently requires "
+                    "micro_batch_size == 1."
+                )
+            qkvzba, cu_seqlens = self._headwise_cp2hp(qkvzba, cu_seqlens)
+            headwise = True
+            cp_div = self.ps.cp_size
+
+        batch, seq_len = qkvzba.shape[:2]
+        if headwise:
+            conv_weight = get_parameter_local_cp_headwise(
+                self.conv1d.weight,
+                dim=0,
+                cp_size=self.ps.cp_size,
+                cp_rank=self.ps.cp_rank,
+                split_sections=self._conv_sections(),
+            ).squeeze(1)
+            A_log = get_parameter_local_cp_headwise(
+                self.A_log, dim=0, cp_size=self.ps.cp_size, cp_rank=self.ps.cp_rank
+            )
+            dt_bias = get_parameter_local_cp_headwise(
+                self.dt_bias, dim=0, cp_size=self.ps.cp_size, cp_rank=self.ps.cp_rank
+            )
+        else:
+            conv_weight = self.conv1d.weight.squeeze(1)
+            A_log = self.A_log
+            dt_bias = self.dt_bias
+
+        query, key, value, gate, beta, alpha = self._split_proj(qkvzba, cp_div)
+        T_total = batch * seq_len
+        qk_local = self.qk_dim_local // cp_div
+        v_local = self.v_dim_local // cp_div
+        nkh_local = self.num_k_heads_local // cp_div
+        nvh_local = self.num_v_heads_local // cp_div
+
+        mixed_qkv = torch.cat(
+            [
+                query.reshape(batch, seq_len, qk_local),
+                key.reshape(batch, seq_len, qk_local),
+                value.reshape(batch, seq_len, v_local),
+            ],
+            dim=-1,
+        ).reshape(T_total, 2 * qk_local + v_local)
+        mixed_qkv = bi_causal_conv1d(mixed_qkv, conv_weight, cu_seqlens, batch, seq_len)
+
+        q_conv, k_conv, v_conv = mixed_qkv.split([qk_local, qk_local, v_local], dim=-1)
+        q_3d = q_conv.reshape(T_total, nkh_local, self.dk).contiguous()
+        k_3d = k_conv.reshape(T_total, nkh_local, self.dk).contiguous()
+        v_3d = v_conv.reshape(T_total, nvh_local, self.dv).contiguous()
+        a_2d = alpha.reshape(T_total, nvh_local).contiguous()
+        b_2d = beta.reshape(T_total, nvh_local).contiguous()
+
+        core_out = bi_fused_gdn(
+            A_log, a_2d, b_2d, dt_bias, q_3d, k_3d, v_3d, cu_seqlens, batch, seq_len
+        )
+        z_3d = gate.reshape(T_total, nvh_local, self.dv)
+        norm_w_eff = (self.norm.weight + 1).to(core_out.dtype)
+        normed = bi_rms_norm_gated(core_out, z_3d, norm_w_eff, eps=self.rms_norm_eps)
+        out = normed.reshape(batch, seq_len, v_local)
+
+        if headwise:
+            out = self._headwise_hp2cp(out, cu_seqlens)
+        out = out.transpose(0, 1).contiguous()
+        out = bi_linear(out, self.o_proj.linear.weight)
+        if return_residual:
+            return out, residual_out
+        return out
 
     def _state_parameters_for_tp(self) -> tuple[torch.Tensor, torch.Tensor]:
         """Return replicated GDN state with a TP gradient all-reduce."""

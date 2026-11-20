@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -80,6 +81,7 @@ class ImplConfig:
     # upstream Megatron linear_cp_mode='chunkwise').
     gdn_cp_mode: str = "headwise"
     qat: QATSpec | dict | None = None
+    bi_mode: bool | None = None
 
 
 def _full_attn_module(layer, name: str):
@@ -220,6 +222,11 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         recompute_modules=recompute_spec,
         deterministic=deterministic,
     )
+    bi_mode = (
+        bool(impl_cfg.bi_mode)
+        if impl_cfg.bi_mode is not None
+        else os.environ.get("VLLM_BATCH_INVARIANT", "0") == "1"
+    )
     model_kwargs: dict[str, Any] = dict(
         router_bias_rate=impl_cfg.router_bias_rate,
         use_thd=impl_cfg.use_thd,
@@ -230,6 +237,7 @@ def build_model(model_cfg: Qwen35Config, *, impl_cfg: ImplConfig) -> ModelBundle
         mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
         mount_vision_model=impl_cfg.mount_vision_model,
         gdn_cp_mode=impl_cfg.gdn_cp_mode,
+        bi_mode=bi_mode,
     )
 
     if vpp is None:

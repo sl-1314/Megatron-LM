@@ -78,8 +78,10 @@ class Experts(nn.Module):
         fp8: bool = False,
         moe_act_recompute: bool = False,
         lora_config: LoraConfig | dict | None = None,
+        bi_mode: bool = False,
     ):
         super().__init__()
+        self.bi_mode = bool(bi_mode)
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
@@ -139,7 +141,22 @@ class Experts(nn.Module):
         tokens_per_expert: torch.Tensor,
         permuted_probs: torch.Tensor | None = None,
         tokens_per_expert_list: list[int] | None = None,
+        *,
+        bi_topk_ids: torch.Tensor | None = None,
+        bi_probs_fp32_bits: Any = None,
     ) -> torch.Tensor:
+        if self.bi_mode and bi_topk_ids is not None:
+            from megatron.lite.model.qwen3_5.lite.bi_ops import bi_triton_experts
+
+            w1_params = [getattr(self.fc1, f"weight{i}") for i in range(self.num_local_experts)]
+            w2_params = [getattr(self.fc2, f"weight{i}") for i in range(self.num_local_experts)]
+            probs_in = (
+                bi_probs_fp32_bits()
+                if callable(bi_probs_fp32_bits)
+                else permuted_probs
+            )
+            assert probs_in is not None
+            return bi_triton_experts(x, w1_params, w2_params, probs_in, bi_topk_ids)
         m_splits = (
             tokens_per_expert.tolist()
             if tokens_per_expert_list is None
