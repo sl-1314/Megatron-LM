@@ -67,6 +67,7 @@ class OptimizerConfig:
     offload_fraction: float | None = None
     use_precision_aware_optimizer: bool | None = None
     decoupled_weight_decay: bool | None = None
+    override_optimizer_config: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
