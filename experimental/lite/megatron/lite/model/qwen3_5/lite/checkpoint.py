@@ -425,6 +425,25 @@ class Qwen35WeightSpec:
             candidates.append(f"{mlp_prefix}.experts.down_proj")
         return candidates
 
+    def expert_slice_from_hf(
+        self,
+        reader,
+        native_name: str,
+        source_index: int,
+        resolved_name: str,
+        device: torch.device | str,
+    ) -> torch.Tensor | None:
+        expert_id = self.expert_global_id(native_name)
+        if expert_id is None or ".experts." not in resolved_name:
+            return None
+        if resolved_name.endswith(".experts.gate_up_proj"):
+            row = reader.get_tensor_slice(resolved_name, expert_id, device=device)
+            gate, up = row.chunk(2, dim=0)
+            return gate if source_index == 0 else up
+        if resolved_name.endswith(".experts.down_proj"):
+            return reader.get_tensor_slice(resolved_name, expert_id, device=device)
+        return None
+
     def transform_hf_source(
         self,
         native_name: str,

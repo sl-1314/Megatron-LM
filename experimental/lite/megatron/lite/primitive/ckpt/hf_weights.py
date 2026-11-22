@@ -269,6 +269,32 @@ class SafeTensorReader:
         self._cached_request, self._cached_tensor = request, tensor
         return tensor
 
+    def get_tensor_slice(
+        self,
+        name: str,
+        index: int,
+        *,
+        device: torch.device | str | None = None,
+    ) -> torch.Tensor:
+        """Read a single leading-axis slice without materializing the full 3D tensor."""
+        target_device = torch.device(self.device if device is None else device)
+        if self.index:
+            filepath = self.path / self.index[name]
+        else:
+            filepath = self.path / "model.safetensors"
+        if self._stack is not None:
+            handle = self._handles.get(filepath)
+            if handle is None:
+                handle = self._stack.enter_context(
+                    safe_open(str(filepath), framework="pt", device="cpu")
+                )
+                self._handles[filepath] = handle
+            tensor = handle.get_slice(name)[index]
+        else:
+            with safe_open(str(filepath), framework="pt", device="cpu") as f:
+                tensor = f.get_slice(name)[index]
+        return tensor if target_device.type == "cpu" else tensor.to(target_device)
+
     def _get_raw_tensor(self, name: str, device: torch.device) -> torch.Tensor:
         if self.index:
             filepath = self.path / self.index[name]
@@ -973,6 +999,7 @@ def load_hf_weights(
         local_start = ps.ep_rank * experts_per_rank
         expert_shard = (experts_per_rank, local_start)
 
+    canonical = {canonical_state_key(key): key for key in state}
     with SafeTensorReader(hf_path) as reader:
         for native_name, hf_names in wmap.items():
             mapped = remap_layer_index(native_name, global_to_local)
@@ -991,12 +1018,13 @@ def load_hf_weights(
                     targets,
                     expert_gid,
                     expert_shard,
+                    canonical=canonical,
                 )
                 if loaded_name is not None:
                     loaded_names.add(loaded_name)
                 continue
 
-            actual = _resolve_param_name(mapped, state)
+            actual = _resolve_param_name(mapped, state, canonical=canonical)
             target = targets.get(actual) if actual is not None else None
             if target is None:
                 pp_size = int(getattr(ps, "pp_size", 1))
@@ -1136,6 +1164,8 @@ def _load_expert_weight(
     targets,
     expert_gid,
     expert_shard,
+    *,
+    canonical: dict[str, str] | None = None,
 ) -> str | None:
     if expert_shard is None:
         raise RuntimeError(
@@ -1146,7 +1176,7 @@ def _load_expert_weight(
         return None
 
     local_name = spec.expert_local_name(native_name, expert_gid - local_start)
-    actual = _resolve_param_name(local_name, state)
+    actual = _resolve_param_name(local_name, state, canonical=canonical)
     target = targets.get(actual) if actual is not None else None
     if target is None:
         present_sources = _present_hf_sources(reader, spec, native_name, hf_names)
@@ -1276,6 +1306,12 @@ def _read_hf_tensors(
             )
         else:
             target_shape = None
+        expert_slice_hook = getattr(spec, "expert_slice_from_hf", None)
+        if callable(expert_slice_hook):
+            sliced = expert_slice_hook(reader, native_name, index, resolved, target.device)
+            if sliced is not None:
+                tensors.append(sliced)
+                continue
         tensor = reader.get_tensor(
             resolved,
             device="cpu" if isinstance(target, DTensor) else target.device,
@@ -1314,10 +1350,13 @@ def _present_hf_sources(
     return present
 
 
-def _resolve_param_name(name: str, state_dict: dict) -> str | None:
+def _resolve_param_name(
+    name: str, state_dict: dict, *, canonical: dict[str, str] | None = None
+) -> str | None:
     if name in state_dict:
         return name
-    canonical = {canonical_state_key(key): key for key in state_dict}
+    if canonical is None:
+        canonical = {canonical_state_key(key): key for key in state_dict}
     if name in canonical:
         return canonical[name]
     for logical_name, key in canonical.items():
