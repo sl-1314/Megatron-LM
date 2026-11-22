@@ -18,6 +18,7 @@ from megatron.lite.primitive.optimizers.fsdp2.adamw import (
     build_adamw_optimizer,
     fsdp2_model_param_dtype,
     get_bool_opt,
+    get_opt_value,
     has_dtensor_grad_or_param,
     local_grad_sq_sum,
 )
@@ -475,7 +476,9 @@ def build_fsdp2_training_optimizer(
         tp_replicated_grad_params=tp_replicated_grad_params,
         tp_replicated_grad_sync_group=ps.tp_group if tp_replicated_grad_params else None,
         grad_norm_accum_dtype="float32",
-        adamw_foreach=False if deterministic else adamw_foreach,
+        adamw_foreach=get_opt_value(opt, "fsdp2_adamw_foreach")
+        if get_opt_value(opt, "fsdp2_adamw_foreach") is not None
+        else (False if deterministic else adamw_foreach),
         use_fp32_master=effective_use_fp32_master,
         model_param_dtypes=model_param_dtypes,
     )
