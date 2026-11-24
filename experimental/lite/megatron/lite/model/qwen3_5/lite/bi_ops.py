@@ -75,19 +75,28 @@ def get_vllm_mrope_cache(
     device_str: str,
 ) -> tuple[torch.Tensor, int, list[int]]:
     with set_current_vllm_config(VllmConfig()):
-        rope = get_rope(
-            head_size=head_dim,
-            max_position=max_position_embeddings,
-            rope_parameters={
-                "rope_type": "default",
-                "rope_theta": rope_theta,
-                "partial_rotary_factor": partial_rotary_factor,
-                "mrope_interleaved": True,
-                "mrope_section": list(mrope_section),
-            },
-            dtype=torch.bfloat16,
-            mrope_positions_factor=4,
-        ).to(device=torch.device(device_str))
+        # Build the cos/sin cache ON THE TARGET DEVICE: vLLM's engine constructs its
+        # MRotaryEmbedding under the model device context, so cos/sin are computed on
+        # GPU. CPU libm cos and GPU cos differ by 1 ULP in fp32 at many arguments, and
+        # after bf16 rounding 63/262144 (position, freq) cache values still differ by
+        # 1 ULP (first at position 4498) — enough to break the rollout-vs-recompute
+        # bitwise parity from that position on. Computing on the same device makes the
+        # two caches bit-identical.
+        with torch.device(device_str):
+            rope = get_rope(
+                head_size=head_dim,
+                max_position=max_position_embeddings,
+                rope_parameters={
+                    "rope_type": "default",
+                    "rope_theta": rope_theta,
+                    "partial_rotary_factor": partial_rotary_factor,
+                    "mrope_interleaved": True,
+                    "mrope_section": list(mrope_section),
+                },
+                dtype=torch.bfloat16,
+                mrope_positions_factor=4,
+            )
+        rope = rope.to(device=torch.device(device_str))
     return rope.cos_sin_cache, int(rope.rotary_dim), list(rope.mrope_section)
 
 
